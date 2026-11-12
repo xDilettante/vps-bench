@@ -1,6 +1,7 @@
 mod bench;
 mod host;
 mod latency;
+mod progress;
 mod report;
 
 #[cfg(test)]
@@ -8,12 +9,12 @@ mod tests;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use host::Host;
+use progress::{RunProgress, Stage};
 use report::{Case, ColorMode, Measurement, Outcome, Report, clean};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{IsTerminal, stderr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,8 +66,11 @@ struct RunArgs {
     /// Путь к новому JSON-файлу.
     #[arg(long, short)]
     output: Option<PathBuf>,
+    /// Скрыть анимацию и промежуточные значения.
+    #[arg(long)]
+    no_progress: bool,
     /// Длительность теста в секундах. Запись fio ограничена объёмом файла.
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=120))]
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=120))]
     seconds: u32,
     /// Потоки многопоточного CPU-теста. По умолчанию используются доступные vCPU.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1024))]
@@ -190,6 +194,20 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     let threads = args
         .threads
         .map_or(report.host.available_vcpus, |n| n as usize);
+    let profiles: Vec<_> = Case::ALL
+        .into_iter()
+        .filter_map(|test| {
+            let (section, parameters) = profile(test, &args, threads);
+            (args.only.contains(&section) && (test != Case::DiskSync || args.disk_sync))
+                .then_some((test, section, parameters))
+        })
+        .collect();
+    let mut progress = RunProgress::new(
+        &report.host.label,
+        profiles.len() + if latency { 3 } else { 0 },
+        color,
+        args.no_progress,
+    );
     let mut unavailable = BTreeMap::new();
     for (tool, required) in [
         (
@@ -219,6 +237,12 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         }
     }
 
+    let stream_iperf = progress.enabled()
+        && args.only.contains(&Section::Network)
+        && report.tools.contains_key("iperf3")
+        && bench::command("iperf3", ["--help"], 3, None)
+            .is_ok_and(|help| help.split_whitespace().any(|arg| arg == "--json-stream"));
+
     if latency {
         let load = args.iperf_host.as_deref().map(|host| latency::Load {
             host,
@@ -230,6 +254,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
             args.ping_count,
             load,
             &unavailable,
+            &mut progress,
         ));
     }
 
@@ -273,11 +298,9 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     };
 
     let mut disk_written = false;
-    for test in Case::ALL {
-        let (section, parameters) = profile(test, &args, threads);
-        if !args.only.contains(&section) || (test == Case::DiskSync && !args.disk_sync) {
-            continue;
-        }
+    for (test, section, parameters) in profiles {
+        let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
+        let stage = progress.start(test.label(), planned);
         let outcome = if let Some(reason) = unavailable.get(test.tool()) {
             Outcome::Failed {
                 reason: reason.clone(),
@@ -300,20 +323,20 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
                 reason: "Тестовый файл не подготовлен".into(),
             }
         } else {
-            if stderr().is_terminal() {
-                eprintln!("Замер · {}", test.label());
-            }
             measure(
                 test,
                 &args,
                 threads,
                 disk.as_ref().map(|dir| dir.path()).map_err(String::as_str),
+                stream_iperf,
+                &stage,
             )
             .into()
         };
         if test == Case::DiskSeqWrite {
             disk_written = matches!(outcome, Outcome::Completed { .. });
         }
+        stage.finish([&outcome]);
         report.measurements.push(Measurement {
             test,
             target: None,
@@ -386,24 +409,28 @@ fn measure(
     args: &RunArgs,
     threads: usize,
     disk: Result<&Path, &str>,
+    stream_iperf: bool,
+    stage: &Stage,
 ) -> Result<Vec<bench::Metric>, String> {
     let seconds = args.seconds;
     match test {
-        Case::CpuSingle => bench::cpu(seconds, 1),
-        Case::CpuMulti => bench::cpu(seconds, threads),
-        Case::RamRead => bench::memory(seconds, args.memory_mib, "read"),
-        Case::RamWrite => bench::memory(seconds, args.memory_mib, "write"),
-        Case::DiskSeqWrite => bench::disk(disk?, seconds, args.disk_mib, "write"),
-        Case::DiskSeqRead => bench::disk(disk?, seconds, args.disk_mib, "read"),
-        Case::DiskRandRead => bench::disk(disk?, seconds, args.disk_mib, "randread"),
-        Case::DiskRandWrite => bench::disk(disk?, seconds, args.disk_mib, "randwrite"),
-        Case::DiskSync => bench::disk(disk?, seconds, args.disk_mib, "sync"),
+        Case::CpuSingle => bench::cpu(seconds, 1, stage),
+        Case::CpuMulti => bench::cpu(seconds, threads, stage),
+        Case::RamRead => bench::memory(seconds, args.memory_mib, "read", stage),
+        Case::RamWrite => bench::memory(seconds, args.memory_mib, "write", stage),
+        Case::DiskSeqWrite => bench::disk(disk?, seconds, args.disk_mib, "write", stage),
+        Case::DiskSeqRead => bench::disk(disk?, seconds, args.disk_mib, "read", stage),
+        Case::DiskRandRead => bench::disk(disk?, seconds, args.disk_mib, "randread", stage),
+        Case::DiskRandWrite => bench::disk(disk?, seconds, args.disk_mib, "randwrite", stage),
+        Case::DiskSync => bench::disk(disk?, seconds, args.disk_mib, "sync", stage),
         _ => bench::network(
             args.iperf_host.as_deref().ok_or("Укажите --iperf-host")?,
             args.iperf_port,
             seconds,
             network_streams(test, args.streams),
             matches!(test, Case::NetDown | Case::NetDownMulti),
+            stream_iperf,
+            stage,
         ),
     }
 }

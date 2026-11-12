@@ -108,3 +108,40 @@ fn total_loss_has_no_rtt_and_load_needs_a_nonzero_live_interval() {
     ));
     assert!(has_load("[  5] 0.00-1.00 sec 128 MBytes 1.00 Gbits/sec"));
 }
+
+#[test]
+fn live_sysbench_samples_are_separate_from_summary_metrics() {
+    use super::bench::sysbench_interval;
+    assert_eq!(
+        sysbench_interval("[ 1s ] thds: 1 eps: 1408.20 lat (ms,95%): 0.72", false),
+        Some(1408.20)
+    );
+    assert_eq!(
+        sysbench_interval("[ 1s ]  47543.08 MiB/sec", true),
+        Some(47543.08)
+    );
+    assert_eq!(sysbench_interval("events per second: 1123.25", false), None);
+}
+
+#[test]
+fn fio_uses_the_last_complete_report_for_final_metrics() {
+    use super::bench::last_fio_report;
+    let output = r#"{"jobs":[{"read":{"bw_bytes":100}}]}
+{"jobs":[{"read":{"bw_bytes":1000}}]}"#;
+    assert_eq!(
+        last_fio_report(output).unwrap()["jobs"][0]["read"]["bw_bytes"],
+        1000
+    );
+    assert!(last_fio_report(&format!("{output}\n{{")).is_err());
+}
+
+#[test]
+fn iperf_stream_keeps_interval_and_receiver_totals_distinct() {
+    use super::bench::{iperf_interval_mbps, iperf_stream_report};
+    let interval = r#"{"event":"interval","data":{"sum":{"bits_per_second":1250000000}}}"#;
+    assert_eq!(iperf_interval_mbps(interval), Some(1250.0));
+    let final_event = r#"{"event":"end","data":{"sum_received":{"bits_per_second":780000000}}}"#;
+    let report = iperf_stream_report(&format!("{interval}\n{final_event}\n")).unwrap();
+    assert_eq!(iperf_metrics(&report).unwrap()[0].value, 780.0);
+    assert!(iperf_stream_report(interval).is_err());
+}

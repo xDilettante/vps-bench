@@ -257,22 +257,27 @@ pub enum ColorMode {
     Never,
 }
 
+impl ColorMode {
+    pub fn enabled(self, is_terminal: bool) -> bool {
+        match self {
+            Self::Auto => {
+                is_terminal
+                    && std::env::var_os("NO_COLOR").is_none()
+                    && std::env::var("TERM").as_deref() != Ok("dumb")
+            }
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 fn table(color: ColorMode, headers: &[&str]) -> Table {
     let mut table = Table::new();
     table
         .load_preset(presets::UTF8_FULL_CONDENSED)
         .apply_modifier(modifiers::UTF8_ROUND_CORNERS)
         .set_content_arrangement(ContentArrangement::Dynamic);
-    let use_color = match color {
-        ColorMode::Auto => {
-            stdout().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none()
-                && std::env::var("TERM").as_deref() != Ok("dumb")
-        }
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-    };
-    if use_color {
+    if color.enabled(stdout().is_terminal()) {
         table.enforce_styling();
     } else {
         table.force_no_tty();

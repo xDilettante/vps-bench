@@ -1,9 +1,11 @@
 use crate::host::{read_cpu_ticks, steal_percent};
+use crate::progress::Stage;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::ffi::OsStr;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 const MIB: f64 = 1024.0 * 1024.0;
 const CPU_PRIME: u32 = 20_000;
@@ -82,13 +84,22 @@ pub fn command(
     deadline: u32,
     dir: Option<&Path>,
 ) -> Result<String, String> {
+    observed_command(tool, args, deadline, dir, None)
+}
+
+fn observed_command(
+    tool: &str,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    deadline: u32,
+    dir: Option<&Path>,
+    observe: Option<&mut dyn FnMut(&str)>,
+) -> Result<String, String> {
     let mut command = timed_command(tool, deadline);
     command.args(args);
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
-    let output = command
-        .output()
+    let output = capture(&mut command, observe)
         .map_err(|err| format!("Не удалось запустить {tool} через timeout: {err}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -98,9 +109,11 @@ pub fn command(
         Some(124 | 137) => return Err(format!("{tool}: превышен предел {deadline} с")),
         _ => {}
     }
-    let json_error = serde_json::from_str::<Value>(&stdout)
-        .ok()
-        .and_then(|value| value["error"].as_str().map(str::to_owned));
+    let error_in = |text| {
+        let value: Value = serde_json::from_str(text).ok()?;
+        json_error(&value).map(str::to_owned)
+    };
+    let json_error = error_in(&stdout).or_else(|| stdout.lines().rev().find_map(error_in));
     let detail = json_error
         .as_deref()
         .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
@@ -108,6 +121,49 @@ pub fn command(
         .unwrap_or_default();
     let detail: String = detail.chars().take(220).collect();
     Err(format!("{tool} ({}): {detail}", output.status))
+}
+
+pub fn capture(command: &mut Command, observe: Option<&mut dyn FnMut(&str)>) -> io::Result<Output> {
+    let Some(observe) = observe else {
+        return command.output();
+    };
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut error_pipe = child.stderr.take().expect("piped stderr");
+    let streams = std::thread::scope(|scope| {
+        let errors = scope.spawn(move || {
+            let mut stderr = Vec::new();
+            error_pipe.read_to_end(&mut stderr)?;
+            Ok::<_, io::Error>(stderr)
+        });
+        let stdout = (|| -> io::Result<Vec<u8>> {
+            let mut output = Vec::new();
+            let mut offset = 0;
+            while reader.read_until(b'\n', &mut output)? != 0 {
+                if let Ok(line) = std::str::from_utf8(&output[offset..]) {
+                    observe(line.trim_end_matches(['\r', '\n']));
+                }
+                offset = output.len();
+            }
+            Ok(output)
+        })();
+        drop(reader);
+        let stderr = errors
+            .join()
+            .map_err(|_| io::Error::other("не удалось прочитать stderr"))??;
+        Ok::<_, io::Error>((stdout?, stderr))
+    });
+    let status = child.wait()?;
+    let (stdout, stderr) = streams?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub fn timed_command(tool: &str, deadline: u32) -> Command {
@@ -141,19 +197,38 @@ fn positive_rate(text: Option<&str>, error: &str) -> Result<f64, String> {
         .ok_or_else(|| error.into())
 }
 
-pub fn cpu(seconds: u32, threads: usize) -> Result<Vec<Metric>, String> {
+pub fn sysbench_interval(line: &str, memory: bool) -> Option<f64> {
+    let (_, body) = line.strip_prefix('[')?.split_once(']')?;
+    let rate = if memory {
+        body.trim().strip_suffix(" MiB/sec")?
+    } else {
+        body.split_once("eps:")?.1.split_whitespace().next()?
+    };
+    rate.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+pub fn cpu(seconds: u32, threads: usize, stage: &Stage) -> Result<Vec<Metric>, String> {
     let before = read_cpu_ticks();
-    let output = command(
+    let mut observe = |line: &str| {
+        if let Some(rate) = sysbench_interval(line, false) {
+            stage.update(format!("{rate:.1} событий/с · за интервал"));
+        }
+    };
+    let output = observed_command(
         "sysbench",
         [
             format!("--time={seconds}"),
             format!("--threads={threads}"),
+            format!("--report-interval={}", u8::from(stage.enabled())),
             format!("--cpu-max-prime={CPU_PRIME}"),
             "cpu".into(),
             "run".into(),
         ],
         seconds + 10,
         None,
+        stage.enabled().then_some(&mut observe),
     )?;
     let mut metrics = vec![Metric::new(MetricKind::EventsPerSecond, cpu_rate(&output)?)];
     if let Some(percent) = before
@@ -165,12 +240,23 @@ pub fn cpu(seconds: u32, threads: usize) -> Result<Vec<Metric>, String> {
     Ok(metrics)
 }
 
-pub fn memory(seconds: u32, block_mib: u32, operation: &str) -> Result<Vec<Metric>, String> {
-    let output = command(
+pub fn memory(
+    seconds: u32,
+    block_mib: u32,
+    operation: &str,
+    stage: &Stage,
+) -> Result<Vec<Metric>, String> {
+    let mut observe = |line: &str| {
+        if let Some(rate) = sysbench_interval(line, true) {
+            stage.update(format!("{rate:.1} МиБ/с · за интервал"));
+        }
+    };
+    let output = observed_command(
         "sysbench",
         [
             format!("--time={seconds}"),
             "--threads=1".into(),
+            format!("--report-interval={}", u8::from(stage.enabled())),
             format!("--memory-block-size={block_mib}M"),
             format!("--memory-total-size={MEMORY_TRANSFER_MIB}M"),
             "--memory-scope=local".into(),
@@ -181,6 +267,7 @@ pub fn memory(seconds: u32, block_mib: u32, operation: &str) -> Result<Vec<Metri
         ],
         seconds + 10,
         None,
+        stage.enabled().then_some(&mut observe),
     )?;
     Ok(vec![Metric::new(
         MetricKind::MibPerSecond,
@@ -188,7 +275,13 @@ pub fn memory(seconds: u32, block_mib: u32, operation: &str) -> Result<Vec<Metri
     )])
 }
 
-pub fn disk(dir: &Path, seconds: u32, size_mib: u32, mode: &str) -> Result<Vec<Metric>, String> {
+pub fn disk(
+    dir: &Path,
+    seconds: u32,
+    size_mib: u32,
+    mode: &str,
+    stage: &Stage,
+) -> Result<Vec<Metric>, String> {
     let create_file = mode == "write";
     let sync = mode == "sync";
     let fio_mode = if sync { "randwrite" } else { mode };
@@ -229,7 +322,43 @@ pub fn disk(dir: &Path, seconds: u32, size_mib: u32, mode: &str) -> Result<Vec<M
     if sync {
         args.push("--fdatasync=1".into());
     }
-    let output = command(
+    if stage.enabled() {
+        args.push("--status-interval=1".into());
+    }
+    let direction = if read { "read" } else { "write" };
+    let mut snapshot = String::new();
+    let mut observe = |line: &str| {
+        if line.starts_with('{') {
+            snapshot.clear();
+        } else if snapshot.is_empty() {
+            return;
+        }
+        snapshot.push_str(line);
+        snapshot.push('\n');
+        if line == "}" {
+            if let Ok(value) = serde_json::from_str::<Value>(&snapshot) {
+                let stats = &value["jobs"][0][direction];
+                if let (Some(bytes), Some(bw), Some(iops)) = (
+                    stats["io_bytes"].as_u64(),
+                    stats["bw_bytes"].as_f64(),
+                    stats["iops"].as_f64(),
+                ) && bytes > 0
+                {
+                    if create_file {
+                        stage.update(format!(
+                            "{:.0}/{size_mib} МиБ · {:.1} МиБ/с",
+                            bytes as f64 / MIB,
+                            bw / MIB
+                        ));
+                    } else {
+                        stage.update(format!("{:.1} МиБ/с · {iops:.0} IOPS · среднее", bw / MIB));
+                    }
+                }
+            }
+            snapshot.clear();
+        }
+    };
+    let output = observed_command(
         "fio",
         args,
         if create_file {
@@ -238,8 +367,9 @@ pub fn disk(dir: &Path, seconds: u32, size_mib: u32, mode: &str) -> Result<Vec<M
             seconds + 15
         },
         Some(dir),
+        stage.enabled().then_some(&mut observe),
     )?;
-    let value = parse_json("fio", &output)?;
+    let value = last_fio_report(&output)?;
     if create_file
         && value
             .pointer("/jobs/0/write/io_bytes")
@@ -248,7 +378,7 @@ pub fn disk(dir: &Path, seconds: u32, size_mib: u32, mode: &str) -> Result<Vec<M
     {
         return Err("fio: не удалось полностью записать тестовый файл".into());
     }
-    let mut metrics = fio_metrics(&value, if read { "read" } else { "write" }, random && !sync)?;
+    let mut metrics = fio_metrics(&value, direction, random && !sync)?;
     if sync {
         let stats = &value["jobs"][0]["sync"]["lat_ns"]["percentile"];
         for (key, kind) in [
@@ -262,6 +392,16 @@ pub fn disk(dir: &Path, seconds: u32, size_mib: u32, mode: &str) -> Result<Vec<M
         }
     }
     Ok(metrics)
+}
+
+pub fn last_fio_report(output: &str) -> Result<Value, String> {
+    // With --status-interval fio emits consecutive JSON documents. The last
+    // document contains the final counters after the job and its sync finish.
+    serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .try_fold(None, |_, document| document.map(Some))
+        .map_err(|err| format!("fio: не удалось разобрать JSON: {err}"))?
+        .ok_or_else(|| "fio: отсутствует итоговый отчёт".into())
 }
 
 pub fn fio_metrics(value: &Value, direction: &str, latency: bool) -> Result<Vec<Metric>, String> {
@@ -296,6 +436,8 @@ pub fn network(
     seconds: u32,
     streams: u32,
     reverse: bool,
+    streaming: bool,
+    stage: &Stage,
 ) -> Result<Vec<Metric>, String> {
     let mut args = vec![
         format!("--client={host}"),
@@ -303,15 +445,74 @@ pub fn network(
         format!("--time={seconds}"),
         format!("--parallel={streams}"),
         "--connect-timeout=3000".into(),
-        "--json".into(),
     ];
+    if streaming {
+        args.extend([
+            "--json-stream".into(),
+            "--forceflush".into(),
+            "--interval=1".into(),
+        ]);
+    } else {
+        args.push("--json".into());
+    }
     if reverse {
         args.push("--reverse".into());
     }
-    iperf_metrics(&parse_json(
+    stage.update("Измерение пропускной способности TCP");
+    let mut observe = |line: &str| {
+        if let Some(rate) = iperf_interval_mbps(line) {
+            stage.update(format!("{rate:.1} Мбит/с · за интервал"));
+        }
+    };
+    let output = observed_command(
         "iperf3",
-        &command("iperf3", args, seconds + 10, None)?,
-    )?)
+        args,
+        seconds + 10,
+        None,
+        streaming.then_some(&mut observe),
+    )?;
+    let report = if streaming {
+        iperf_stream_report(&output)?
+    } else {
+        parse_json("iperf3", &output)?
+    };
+    iperf_metrics(&report)
+}
+
+pub fn iperf_interval_mbps(line: &str) -> Option<f64> {
+    let frame: Value = serde_json::from_str(line).ok()?;
+    if frame["event"].as_str() != Some("interval") {
+        return None;
+    }
+    number(&frame["data"]["sum"]["bits_per_second"], "iperf3 interval")
+        .ok()
+        .map(|bps| bps / 1_000_000.0)
+}
+
+pub fn iperf_stream_report(output: &str) -> Result<Value, String> {
+    let mut final_report = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut frame = parse_json("iperf3", line)?;
+        if let Some(error) = json_error(&frame) {
+            return Err(format!("iperf3: {error}"));
+        }
+        if frame["event"].as_str() == Some("end") {
+            final_report = Some(json!({"end": frame["data"].take()}));
+        }
+    }
+    final_report.ok_or_else(|| "iperf3: отсутствует итоговое событие".into())
+}
+
+fn json_error(value: &Value) -> Option<&str> {
+    value["error"].as_str().or_else(|| {
+        if value["event"].as_str() == Some("error") {
+            value["data"]
+                .as_str()
+                .or_else(|| value["data"]["error"].as_str())
+        } else {
+            None
+        }
+    })
 }
 
 pub fn iperf_metrics(value: &Value) -> Result<Vec<Metric>, String> {

@@ -1,8 +1,8 @@
-use crate::bench::{Metric, MetricKind, timed_command};
+use crate::bench::{Metric, MetricKind, capture, timed_command};
+use crate::progress::{RunProgress, Stage};
 use crate::report::{Case, Measurement, Outcome};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, stderr};
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,28 +27,43 @@ pub fn run(
     count: u32,
     load: Option<Load<'_>>,
     unavailable: &BTreeMap<&str, String>,
+    progress: &mut RunProgress,
 ) -> Vec<Measurement> {
     let mut measurements = Vec::new();
-    let probe_deadline = (count * INTERVAL_MS).div_ceil(1000) + 3;
+    let probe_seconds = (count * INTERVAL_MS).div_ceil(1000);
+    let probe_deadline = probe_seconds + 3;
     let load_seconds = probe_deadline + 5;
 
     for test in [Case::PingIdle, Case::PingUpload, Case::PingDownload] {
         let server = load.filter(|_| test != Case::PingIdle);
+        let first = measurements.len();
+        let stage = progress.start(
+            test.label(),
+            Some(if server.is_some() {
+                load_seconds
+            } else {
+                probe_seconds
+            }),
+        );
         let failure = unavailable
             .get("ping")
             .or_else(|| server.and(unavailable.get("iperf3")));
         let results = if let Some(reason) = failure {
             Err(reason.clone())
         } else if test == Case::PingIdle || server.is_some() {
-            if stderr().is_terminal() {
-                eprintln!("Замер · {} · {} узлов", test.label(), targets.len());
-            }
-            let capture = || ping_all(targets, count, probe_deadline);
+            let probe = || {
+                stage.update(format!("Ожидание ответов · узлов {}", targets.len()));
+                ping_all(targets, count, probe_deadline, &stage)
+            };
             match server {
-                Some(server) => {
-                    under_load(server, load_seconds, test == Case::PingDownload, capture)
-                }
-                None => Ok(capture()),
+                Some(server) => under_load(
+                    server,
+                    load_seconds,
+                    test == Case::PingDownload,
+                    &stage,
+                    probe,
+                ),
+                None => Ok(probe()),
             }
         } else {
             Ok(Vec::new())
@@ -90,16 +105,26 @@ pub fn run(
                 outcome,
             });
         }
+        stage.finish(
+            measurements[first..]
+                .iter()
+                .map(|measurement| &measurement.outcome),
+        );
     }
     measurements
 }
 
-fn ping_all(targets: &[String], count: u32, deadline: u32) -> Vec<Result<Probe, String>> {
+fn ping_all(
+    targets: &[String],
+    count: u32,
+    deadline: u32,
+    stage: &Stage,
+) -> Vec<Result<Probe, String>> {
     thread::scope(|scope| {
         let workers: Vec<_> = targets
             .iter()
             .map(|target| {
-                thread::Builder::new().spawn_scoped(scope, || ping(target, count, deadline))
+                thread::Builder::new().spawn_scoped(scope, || ping(target, count, deadline, stage))
             })
             .collect();
         workers
@@ -114,23 +139,32 @@ fn ping_all(targets: &[String], count: u32, deadline: u32) -> Vec<Result<Probe, 
     })
 }
 
-fn ping(target: &str, count: u32, deadline: u32) -> Result<Probe, String> {
+fn ping(target: &str, count: u32, deadline: u32, stage: &Stage) -> Result<Probe, String> {
     let interval = format!("{:.3}", f64::from(INTERVAL_MS) / 1000.0);
-    let output = timed_command("ping", deadline + 3)
-        .args([
-            "-n",
-            "-i",
-            &interval,
-            "-c",
-            &count.to_string(),
-            "-W",
-            "1",
-            "-w",
-            &deadline.to_string(),
-            "--",
-            target,
-        ])
-        .output()
+    let mut command = timed_command("ping", deadline + 3);
+    command.args([
+        "-n",
+        "-i",
+        &interval,
+        "-c",
+        &count.to_string(),
+        "-W",
+        "1",
+        "-w",
+        &deadline.to_string(),
+        "--",
+        target,
+    ]);
+    let mut replies = 0;
+    let mut observe = |line: &str| {
+        if let Some(rtt) = reply_rtt(line) {
+            replies += 1;
+            stage.update(format!(
+                "{target} · RTT {rtt:.3} мс · ответов {replies}/{count}"
+            ));
+        }
+    };
+    let output = capture(&mut command, stage.enabled().then_some(&mut observe))
         .map_err(|err| format!("ping: {err}"))?;
     // iputils also uses code 1 when some or all echo replies are missing.
     if !matches!(output.status.code(), Some(0 | 1)) {
@@ -153,17 +187,7 @@ pub fn parse_ping(text: &str) -> Result<Probe, String> {
     let (sent, received) = counts
         .filter(|&(sent, received)| sent > 0 && received <= sent)
         .ok_or("ping: отсутствует итоговая статистика iputils")?;
-    let mut rtts: Vec<f64> = text
-        .lines()
-        .filter(|line| line.contains("icmp_seq=") && !line.contains("DUP!"))
-        .filter_map(|line| {
-            let (_, time) = line
-                .split_once(" time=")
-                .or_else(|| line.split_once(" time<"))?;
-            time.split_once(" ms")?.0.parse::<f64>().ok()
-        })
-        .filter(|rtt| rtt.is_finite() && *rtt >= 0.0)
-        .collect();
+    let mut rtts: Vec<f64> = text.lines().filter_map(reply_rtt).collect();
     if rtts.len() != received {
         return Err(format!(
             "ping: распознано {} RTT из {received} ответов",
@@ -194,12 +218,28 @@ pub fn parse_ping(text: &str) -> Result<Probe, String> {
     Ok(Probe { address, metrics })
 }
 
+fn reply_rtt(line: &str) -> Option<f64> {
+    if !line.contains("icmp_seq=") || line.contains("DUP!") {
+        return None;
+    }
+    let (_, time) = line
+        .split_once(" time=")
+        .or_else(|| line.split_once(" time<"))?;
+    time.split_once(" ms")?
+        .0
+        .parse::<f64>()
+        .ok()
+        .filter(|rtt| rtt.is_finite() && *rtt >= 0.0)
+}
+
 fn under_load<T>(
     server: Load<'_>,
     seconds: u32,
     reverse: bool,
+    stage: &Stage,
     capture: impl FnOnce() -> T,
 ) -> Result<T, String> {
+    stage.update("Ожидание передачи iperf3");
     let log = NamedTempFile::new().map_err(|err| format!("iperf3: {err}"))?;
     let mut command = timed_command("iperf3", seconds + 12);
     command.args([
@@ -242,6 +282,7 @@ fn under_load<T>(
         if child.try_wait().map_err(|err| err.to_string())?.is_some() {
             return Err("iperf3 завершился до окончания замера RTT".into());
         }
+        stage.update("ICMP завершён · ожидание итога TCP");
         Ok(result)
     })();
     let status = child.wait().map_err(|err| format!("iperf3: {err}"))?;

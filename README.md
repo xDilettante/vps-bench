@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/xDilettante/vps-bench)](https://github.com/xDilettante/vps-bench/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Produces a terminal table and a local JSON report.
+Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Displays live measurements in the terminal and saves a local JSON report.
 
 | Раздел | Метрики |
 |---|---|
@@ -20,10 +20,20 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and netwo
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.2.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.3.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
+
+## Демонстрация в WSL
+
+Команда ниже выполняет 40 ICMP-проб по локальному адресу Ubuntu и показывает обновления около восьми секунд. Для демо нужны `curl` и `iputils-ping`.
+
+```powershell
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.3.0/run.sh | bash -s -- run --only latency --ping-target 127.0.0.1 --ping-count 40'
+```
+
+В терминале видны текущий этап, шкала времени и промежуточные показатели. Для CPU, RAM и TCP выводятся значения за интервал, для диска — средние с начала этапа, для ICMP — RTT последнего ответа и счётчик ответов. Для промежуточной скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее). При перенаправлении stderr или с `--no-progress` остаётся итоговый отчёт.
 
 ## Запуск на Linux и сравнение
 
@@ -47,7 +57,7 @@ tar -xzf vps-bench-linux-x86_64.tar.gz
 ./vps-bench --color never compare vps-a.json vps-b.json
 ```
 
-Без `--output` отчёт сохраняется как `vps-bench-<timestamp>.json`. Существующие файлы защищены от перезаписи. При частичном сбое отчёт сохраняется со статусом каждого теста, а код завершения равен 1. Цвет включается в терминале автоматически и учитывает `NO_COLOR`. Отчёты хранятся локально.
+Без `--output` отчёт сохраняется как `vps-bench-<timestamp>.json`. Существующие файлы защищены от перезаписи. При частичном сбое отчёт сохраняется со статусом каждого теста, а код завершения равен 1. Цвет включается в терминале автоматически и учитывает `NO_COLOR`. Отчёты хранятся локально. Параметр `--seconds` задаёт длительность тестов с таймером, по умолчанию 15 секунд. Запись на диск ограничена объёмом тестового файла.
 
 ## Методика
 
