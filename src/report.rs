@@ -16,6 +16,7 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Section {
     Cpu,
+    Crypto,
     Memory,
     Disk,
     Network,
@@ -23,8 +24,9 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ORDER: [Self; 5] = [
+    pub const ORDER: [Self; 6] = [
         Self::Cpu,
+        Self::Crypto,
         Self::Memory,
         Self::Disk,
         Self::Latency,
@@ -34,6 +36,7 @@ impl Section {
     pub fn heading(self, color: bool) -> String {
         let title = match self {
             Self::Cpu => "CPU · Процессор",
+            Self::Crypto => "Crypto · Криптография",
             Self::Memory => "RAM · Оперативная память",
             Self::Disk => "Диск · Накопитель",
             Self::Network => "Сеть · Пропускная способность TCP",
@@ -52,6 +55,8 @@ impl Section {
 pub enum Case {
     CpuSingle,
     CpuMulti,
+    CryptoSha256,
+    CryptoAes256Gcm,
     RamRead,
     RamWrite,
     DiskSeqWrite,
@@ -69,9 +74,11 @@ pub enum Case {
 }
 
 impl Case {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::CpuSingle,
         Self::CpuMulti,
+        Self::CryptoSha256,
+        Self::CryptoAes256Gcm,
         Self::RamRead,
         Self::RamWrite,
         Self::DiskSeqWrite,
@@ -89,6 +96,8 @@ impl Case {
         match self {
             Self::CpuSingle => "Однопоточная производительность",
             Self::CpuMulti => "Многопоточная производительность",
+            Self::CryptoSha256 => "SHA-256 · Хеширование",
+            Self::CryptoAes256Gcm => "AES-256-GCM · Шифрование",
             Self::RamRead | Self::DiskSeqRead => "Последовательное чтение",
             Self::RamWrite | Self::DiskSeqWrite => "Последовательная запись",
             Self::DiskRandRead => "Случайное чтение",
@@ -107,6 +116,7 @@ impl Case {
     pub fn section(self) -> Section {
         match self {
             Self::CpuSingle | Self::CpuMulti => Section::Cpu,
+            Self::CryptoSha256 | Self::CryptoAes256Gcm => Section::Crypto,
             Self::RamRead | Self::RamWrite => Section::Memory,
             Self::DiskSeqWrite
             | Self::DiskSeqRead
@@ -130,6 +140,19 @@ impl Case {
                 "sysbench cpu · простые числа до {CPU_PRIME} · {} · {seconds} с",
                 threads(&parameters["threads"])
             ),
+            Section::Crypto => {
+                let mode = if parameters["aead"].as_bool() == Some(true) {
+                    " -aead"
+                } else {
+                    ""
+                };
+                format!(
+                    "openssl speed{mode} · блок {} КиБ · {} · {seconds} с, шаг {} с",
+                    amount("block_kib"),
+                    threads(&parameters["threads"]),
+                    amount("sample_seconds")
+                )
+            }
             Section::Memory => format!(
                 "sysbench memory · буфер {} МиБ · {} · до {seconds} с",
                 amount("block_mib"),
@@ -189,6 +212,7 @@ impl Case {
     pub fn tool(self) -> &'static str {
         match self.section() {
             Section::Cpu | Section::Memory => "sysbench",
+            Section::Crypto => "openssl",
             Section::Disk => "fio",
             Section::Latency => "ping",
             Section::Network => "iperf3",
@@ -371,6 +395,7 @@ impl Report {
                 clean(self.host.cpu_model.as_deref().unwrap_or(&self.host.arch)),
                 self.host.available_vcpus
             )),
+            Section::Crypto => self.tools.get("openssl").map(|version| clean(version)),
             Section::Memory => {
                 let mut details = Vec::new();
                 if let Some(mib) = self.host.ram_mib {

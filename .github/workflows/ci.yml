@@ -22,11 +22,20 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: bash -n run.sh
+      - run: cargo build --locked
+      - name: Check Crypto stages and comparison
+        run: |
+          openssl version
+          TERM=xterm-256color script -qefc 'stty cols 100 && target/debug/vps-bench run --only crypto --seconds 3 --output /tmp/vps-bench-crypto.json' /tmp/vps-bench-crypto-terminal.log < /dev/null
+          grep -Eq '(Плохо|Норма|Хорошо).*МиБ/с · интервал [12]/3' /tmp/vps-bench-crypto-terminal.log
+          test "$(grep -c 'Итог.*МиБ/с' /tmp/vps-bench-crypto-terminal.log)" -eq 2
+          jq -e '(.tools.openssl | length > 0) and (.measurements | map(.test) == ["crypto_sha256", "crypto_aes256_gcm"] and all(.[]; .status == "completed" and .parameters.block_kib == 16 and .parameters.sample_seconds == 1 and any(.metrics[]; .kind == "mib_per_second" and .value > 0)))' /tmp/vps-bench-crypto.json
+          target/debug/vps-bench --color never compare /tmp/vps-bench-crypto.json /tmp/vps-bench-crypto.json > /tmp/vps-bench-crypto-compare.log
+          test "$(grep -c 'Близко +0.00%' /tmp/vps-bench-crypto-compare.log)" -eq 2
       - name: Check ICMP and TCP load on loopback
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y iputils-ping iperf3
-          cargo build --locked
           iperf3 -s -B 127.0.0.1 -p 35201 > /tmp/vps-bench-iperf.log 2>&1 &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT

@@ -18,6 +18,34 @@ fn parses_sysbench_cpu_and_memory_rates() {
 }
 
 #[test]
+fn openssl_summary_requires_the_requested_block_size_and_algorithm() {
+    use super::bench::openssl_rate;
+
+    assert_eq!(
+        openssl_rate("+H:16384\n+F:25:sha256:1048576000.00\n", "sha256"),
+        Ok(1000.0)
+    );
+    assert_eq!(
+        openssl_rate("+H:16384\n+F:24:SHA2-256:1048576000.00\n", "sha256"),
+        Ok(1000.0)
+    );
+    for name in ["AES-256-GCM", "aes-256-gcm", "id-aes256-GCM"] {
+        let output = format!("+H:16384\n+F:25:{name}:2147483648.00\n");
+        assert_eq!(openssl_rate(&output, "aes-256-gcm"), Ok(2048.0));
+    }
+    for output in [
+        "+F:25:sha256:1048576000.00\n",
+        "+H:8192\n+F:25:sha256:1048576000.00\n",
+        "+H:16384:8192\n+F:25:sha256:1048576000.00:524288000.00\n",
+        "+H:16384\n+F:25:sha512:1048576000.00\n",
+        "+H:16384\n+F:25:sha256:NaN\n",
+        "+H:16384\n+F:25:sha256:0.00\n",
+    ] {
+        assert!(openssl_rate(output, "sha256").is_err(), "{output}");
+    }
+}
+
+#[test]
 fn fio_uses_bytes_per_second_and_total_latency_in_nanoseconds() {
     let result = json!({"jobs": [{"error": 0, "read": {
         "io_bytes": 4096000,

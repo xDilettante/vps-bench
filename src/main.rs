@@ -23,7 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, NamedTempFile};
 
 #[derive(Parser)]
-#[command(version, about = "Замеры CPU, памяти, диска и сети на Linux VPS")]
+#[command(
+    version,
+    about = "Замеры CPU, криптографии, памяти, диска и сети на Linux VPS"
+)]
 struct Cli {
     /// Цвет таблицы в терминале.
     #[arg(long, global = true, value_enum, default_value = "auto")]
@@ -50,7 +53,7 @@ struct RunArgs {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "cpu,memory,disk,network,latency"
+        default_value = "cpu,crypto,memory,disk,network,latency"
     )]
     only: Vec<Section>,
     /// Имя VPS в отчёте. По умолчанию используется имя хоста.
@@ -216,6 +219,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
             "sysbench",
             args.only.contains(&Section::Cpu) || args.only.contains(&Section::Memory),
         ),
+        ("openssl", args.only.contains(&Section::Crypto)),
         ("fio", args.only.contains(&Section::Disk)),
         (
             "iperf3",
@@ -224,7 +228,11 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         ("ping", latency),
     ] {
         if required {
-            let version_flag = if tool == "ping" { "-V" } else { "--version" };
+            let version_flag = match tool {
+                "ping" => "-V",
+                "openssl" => "version",
+                _ => "--version",
+            };
             match bench::command(tool, [version_flag], 3, None) {
                 Ok(output) => {
                     report.tools.insert(
@@ -321,8 +329,14 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
             let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
             let stage = progress.start(test, &parameters, planned);
             let outcome = if let Some(reason) = unavailable.get(test.tool()) {
-                Outcome::Failed {
-                    reason: reason.clone(),
+                if section == Section::Crypto {
+                    Outcome::Skipped {
+                        reason: format!("OpenSSL недоступен · {reason}"),
+                    }
+                } else {
+                    Outcome::Failed {
+                        reason: reason.clone(),
+                    }
                 }
             } else if section == Section::Network && args.iperf_host.is_none() {
                 Outcome::Skipped {
@@ -385,6 +399,14 @@ fn profile(test: Case, args: &RunArgs, threads: usize) -> Value {
     match test {
         Case::CpuSingle => json!({"seconds": seconds, "threads": 1}),
         Case::CpuMulti => json!({"seconds": seconds, "threads": threads}),
+        Case::CryptoSha256 | Case::CryptoAes256Gcm => json!({
+            "seconds": seconds,
+            "threads": 1,
+            "block_kib": bench::CRYPTO_BLOCK_KIB,
+            "sample_seconds": bench::CRYPTO_SAMPLE_SECONDS,
+            "elapsed": true,
+            "aead": test == Case::CryptoAes256Gcm,
+        }),
         Case::RamRead | Case::RamWrite => {
             json!({"seconds": seconds, "block_mib": args.memory_mib, "threads": 1})
         }
@@ -424,6 +446,8 @@ fn measure(
     match test {
         Case::CpuSingle => bench::cpu(seconds, 1, stage),
         Case::CpuMulti => bench::cpu(seconds, threads, stage),
+        Case::CryptoSha256 => bench::crypto(seconds, "sha256", stage),
+        Case::CryptoAes256Gcm => bench::crypto(seconds, "aes-256-gcm", stage),
         Case::RamRead => bench::memory(seconds, args.memory_mib, "read", stage),
         Case::RamWrite => bench::memory(seconds, args.memory_mib, "write", stage),
         Case::DiskSeqWrite => bench::disk(disk?, seconds, args.disk_mib, "write", stage),

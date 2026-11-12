@@ -182,9 +182,12 @@ impl Stage<'_> {
     fn primary_metric(&self) -> MetricKind {
         match self.test {
             Case::CpuSingle | Case::CpuMulti => MetricKind::EventsPerSecond,
-            Case::RamRead | Case::RamWrite | Case::DiskSeqWrite | Case::DiskSeqRead => {
-                MetricKind::MibPerSecond
-            }
+            Case::CryptoSha256
+            | Case::CryptoAes256Gcm
+            | Case::RamRead
+            | Case::RamWrite
+            | Case::DiskSeqWrite
+            | Case::DiskSeqRead => MetricKind::MibPerSecond,
             Case::DiskRandRead | Case::DiskRandWrite | Case::DiskSync => MetricKind::Iops,
             Case::NetUp | Case::NetDown | Case::NetUpMulti | Case::NetDownMulti => {
                 MetricKind::MegabitsPerSecond

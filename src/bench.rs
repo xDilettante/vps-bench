@@ -9,6 +9,8 @@ use std::process::{Command, Output, Stdio};
 
 const MIB: f64 = 1024.0 * 1024.0;
 pub const CPU_PRIME: u32 = 20_000;
+pub const CRYPTO_BLOCK_KIB: u32 = 16;
+pub const CRYPTO_SAMPLE_SECONDS: u32 = 1;
 pub const MEMORY_TRANSFER_MIB: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +193,33 @@ pub fn memory_rate(text: &str) -> Result<f64, String> {
     positive_rate(rate, "sysbench RAM: отсутствует пропускная способность")
 }
 
+pub fn openssl_rate(text: &str, algorithm: &str) -> Result<f64, String> {
+    let expected_block = CRYPTO_BLOCK_KIB * 1024;
+    let block = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("+H:"))
+        .and_then(|size| size.parse::<u32>().ok());
+    if block != Some(expected_block) {
+        return Err(format!(
+            "openssl speed · ожидается блок {expected_block} байт"
+        ));
+    }
+
+    let rate = text.lines().find_map(|line| {
+        let (_, fields) = line.trim().strip_prefix("+F:")?.split_once(':')?;
+        let (name, rate) = fields.split_once(':')?;
+        let alias = match algorithm {
+            "sha256" => {
+                name.eq_ignore_ascii_case("sha2-256") || name.eq_ignore_ascii_case("sha-256")
+            }
+            "aes-256-gcm" => name.eq_ignore_ascii_case("id-aes256-gcm"),
+            _ => false,
+        };
+        (alias || name.eq_ignore_ascii_case(algorithm)).then_some(rate)
+    });
+    positive_rate(rate, "openssl speed · отсутствует корректная скорость").map(|bytes| bytes / MIB)
+}
+
 fn positive_rate(text: Option<&str>, error: &str) -> Result<f64, String> {
     text.and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -238,6 +267,39 @@ pub fn cpu(seconds: u32, threads: usize, stage: &Stage<'_>) -> Result<Vec<Metric
         metrics.push(Metric::new(MetricKind::CpuStealPercent, percent));
     }
     Ok(metrics)
+}
+
+pub fn crypto(seconds: u32, algorithm: &str, stage: &Stage<'_>) -> Result<Vec<Metric>, String> {
+    let block = (CRYPTO_BLOCK_KIB * 1024).to_string();
+    let interval = CRYPTO_SAMPLE_SECONDS.to_string();
+    let mut args = vec![
+        "speed", "-mr", "-elapsed", "-seconds", &interval, "-bytes", &block, "-evp", algorithm,
+    ];
+    if algorithm == "aes-256-gcm" {
+        args.push("-aead");
+    }
+
+    // OpenSSL emits its rate at the end of a run. Each second is a separate sample.
+    let mut total_rate = 0.0;
+    for sample in 1..=seconds {
+        let rate = command(
+            "openssl",
+            args.iter().copied(),
+            CRYPTO_SAMPLE_SECONDS + 10,
+            None,
+        )
+        .and_then(|output| openssl_rate(&output, algorithm))
+        .map_err(|err| format!("Интервал {sample}/{seconds} · {err}"))?;
+        total_rate += rate;
+        stage.sample(
+            rate,
+            format!("{rate:.1} МиБ/с · интервал {sample}/{seconds}"),
+        );
+    }
+    Ok(vec![Metric::new(
+        MetricKind::MibPerSecond,
+        total_rate / f64::from(seconds),
+    )])
 }
 
 pub fn memory(
