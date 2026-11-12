@@ -9,6 +9,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, 
 | Раздел | Метрики |
 |---|---|
 | CPU и RAM | События/с в одном и нескольких потоках, CPU steal, чтение и запись RAM в МиБ/с |
+| Стабильность CPU | Секундные отсчёты за 5–10 минут, медиана, p10 и изменение скорости между первой и последней минутой |
 | Crypto | Скорость SHA-256 и шифрования AES-256-GCM в МиБ/с |
 | Диск | Последовательная скорость, случайные IOPS и задержки p50/p95/p99, опционально `fdatasync` |
 | TCP | Входящая и исходящая скорость, повторные передачи и средний RTT при наличии данных |
@@ -21,7 +22,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, 
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.8.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
@@ -31,7 +32,7 @@ ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.gith
 Короткий прогон показывает CPU, Crypto, память и диск. В Ubuntu для него нужны `curl`, `sysbench`, `openssl` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.8.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
 ```
 
 В терминале шкала времени и цветная оценка замера показаны на разных строках. Полоса обновляется с каждым замером и меняет цвет при пересечении порога. Для CPU, Crypto, RAM и TCP используется скорость за интервал, для диска — скорость последовательного I/O или случайные IOPS с начала этапа, для ICMP — RTT последнего ответа. Для живой скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее).
@@ -39,6 +40,18 @@ wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubuserc
 После каждого этапа в терминале остаётся строка «Итог» с оценкой по финальным данным. Для ICMP выводятся RTT p95 и потери отдельно по каждому узлу. У быстрых тестов и TCP со старым `iperf3` первый доступный результат может быть итоговым. Живые оценки используют встроенные пороги VPS Bench. При перенаправлении stderr или с `--no-progress` выводится итоговый отчёт.
 
 Для просмотра только RTT укажите `run --only latency --ping-target 127.0.0.1 --ping-count 40`. Живой экран, итог и сравнение показывают параметры каждого этапа. Диск определяется по каталогу `--disk-dir`. При доступности `findmnt` и `lsblk` выводятся том, файловая система и характеристики блочного устройства, видимые Linux. Флаг `ROTA` относится к устройству в гостевой ОС.
+
+## Стабильность CPU
+
+Режим `--only stability` нагружает CPU одним непрерывным прогоном `sysbench` и обновляет график по секундным отсчётам. Столбец графика показывает среднюю скорость за указанный интервал. Рядом виден диапазон скоростей на графике. В PowerShell можно запустить пятиминутный тест в один поток.
+
+```powershell
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --only stability --stability-minutes 5 --threads 1'
+```
+
+`--stability-minutes` принимает целое число от 5 до 10, по умолчанию 5. Если опустить `--threads`, используются доступные vCPU. Итог показывает медиану и p10 скорости по всем отсчётам, медианы первой и последней минут и процент изменения. p10 берётся методом ближайшего ранга. Для каждой минуты видно покрытие из 60 отсчётов. Sysbench может завершиться до печати последнего отсчёта, поэтому в статистику входят только полученные значения. [Промежуточная статистика sysbench](https://github.com/akopytov/sysbench)
+
+JSON сохраняет показатели и `cpu_series.samples` с временем и скоростью каждого отсчёта. Результаты сравниваются через `compare a.json b.json` или `--baseline`. Для сопоставимых замеров задайте одинаковую длительность и число потоков.
 
 ## Оценки первого запуска
 

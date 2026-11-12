@@ -1,6 +1,6 @@
 use crate::bench::{Metric, MetricKind};
 use crate::quality::rating;
-use crate::report::{Case, ColorMode, Outcome, Section, clean};
+use crate::report::{Case, ColorMode, Outcome, Section, clean, metric_value};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use serde_json::Value;
 use std::fmt::Write;
@@ -64,7 +64,11 @@ impl RunProgress {
                     "\n  {meter}"
                 });
             }
-            template.push_str("\n  {wide_msg}");
+            template.push_str(if test == Case::CpuStability {
+                "\n  {msg}"
+            } else {
+                "\n  {wide_msg}"
+            });
             let workload = test.workload(parameters);
             let style = ProgressStyle::with_template(&template)
                 .expect("valid progress template")
@@ -147,9 +151,26 @@ impl Stage<'_> {
         let mut summaries = String::new();
         for (target, outcome) in outcomes {
             match outcome {
-                Outcome::Completed { metrics } => {
+                Outcome::Completed {
+                    metrics,
+                    cpu_series,
+                } => {
                     complete += 1;
                     self.append_summary(&mut summaries, target, metrics);
+                    if let Some(series) = cpu_series
+                        && let Some(first) =
+                            metric_value(metrics, MetricKind::FirstMinuteMedianEventsPerSecond)
+                        && let Some(last) =
+                            metric_value(metrics, MetricKind::LastMinuteMedianEventsPerSecond)
+                    {
+                        let change = metric_value(metrics, MetricKind::LastMinuteChangePercent)
+                            .map_or_else(String::new, |value| format!(" ({value:+.2}%)"));
+                        let _ = write!(
+                            summaries,
+                            "\n  Первая → последняя минута · {first:.2} → {last:.2} событий/с{change}\n  {}",
+                            series.coverage()
+                        );
+                    }
                 }
                 Outcome::Failed { .. } => failed += 1,
                 Outcome::Skipped { .. } => skipped += 1,
@@ -182,6 +203,7 @@ impl Stage<'_> {
     fn primary_metric(&self) -> MetricKind {
         match self.test {
             Case::CpuSingle | Case::CpuMulti => MetricKind::EventsPerSecond,
+            Case::CpuStability => MetricKind::EventsPerSecondP50,
             Case::CryptoSha256
             | Case::CryptoAes256Gcm
             | Case::RamRead
@@ -212,6 +234,7 @@ impl Stage<'_> {
         };
         for kind in [
             self.primary_metric(),
+            MetricKind::EventsPerSecondP10,
             MetricKind::PacketLossPercent,
             MetricKind::SyncP95Ms,
         ] {
@@ -221,6 +244,8 @@ impl Stage<'_> {
             let value = metric.value;
             let message = match kind {
                 MetricKind::EventsPerSecond => format!("{value:.2} событий/с"),
+                MetricKind::EventsPerSecondP50 => format!("медиана {value:.2} событий/с"),
+                MetricKind::EventsPerSecondP10 => format!("p10 {value:.2} событий/с"),
                 MetricKind::MibPerSecond => format!("{value:.2} МиБ/с"),
                 MetricKind::Iops => format!("{value:.2} IOPS"),
                 MetricKind::MegabitsPerSecond => format!("{value:.2} Мбит/с"),

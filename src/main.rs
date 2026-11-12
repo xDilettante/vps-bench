@@ -5,6 +5,7 @@ mod latency;
 mod progress;
 mod quality;
 mod report;
+mod stability;
 
 #[cfg(test)]
 mod tests;
@@ -14,6 +15,7 @@ use host::Host;
 use progress::{RunProgress, Stage};
 use report::{Case, ColorMode, Measurement, Outcome, Report, Section, clean};
 use serde_json::{Value, json};
+use stability::MINUTE_SECONDS;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -71,6 +73,9 @@ struct RunArgs {
     /// Длительность теста в секундах. Запись fio ограничена объёмом файла.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=120))]
     seconds: u32,
+    /// Длительность прогона --only stability в минутах.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(5..=10))]
+    stability_minutes: u32,
     /// Потоки многопоточного CPU-теста. По умолчанию используются доступные vCPU.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1024))]
     threads: Option<u32>,
@@ -217,7 +222,9 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     for (tool, required) in [
         (
             "sysbench",
-            args.only.contains(&Section::Cpu) || args.only.contains(&Section::Memory),
+            args.only.iter().any(|section| {
+                matches!(section, Section::Cpu | Section::Stability | Section::Memory)
+            }),
         ),
         ("openssl", args.only.contains(&Section::Crypto)),
         ("fio", args.only.contains(&Section::Disk)),
@@ -326,7 +333,9 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         }
         progress.section(section, report.section_context(section).as_deref());
         for (test, parameters) in tests {
-            let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
+            let planned = parameters["seconds"]
+                .as_u64()
+                .and_then(|seconds| u32::try_from(seconds).ok());
             let stage = progress.start(test, &parameters, planned);
             let outcome = if let Some(reason) = unavailable.get(test.tool()) {
                 if section == Section::Crypto {
@@ -365,7 +374,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
                     stream_iperf,
                     &stage,
                 )
-                .into()
+                .unwrap_or_else(|reason| Outcome::Failed { reason })
             };
             if test == Case::DiskSeqWrite {
                 disk_written = matches!(outcome, Outcome::Completed { .. });
@@ -399,6 +408,13 @@ fn profile(test: Case, args: &RunArgs, threads: usize) -> Value {
     match test {
         Case::CpuSingle => json!({"seconds": seconds, "threads": 1}),
         Case::CpuMulti => json!({"seconds": seconds, "threads": threads}),
+        Case::CpuStability => json!({
+            "seconds": args.stability_minutes * MINUTE_SECONDS,
+            "threads": threads,
+            "cpu_max_prime": bench::CPU_PRIME,
+            "sample_seconds": 1,
+            "comparison_window_seconds": MINUTE_SECONDS,
+        }),
         Case::CryptoSha256 | Case::CryptoAes256Gcm => json!({
             "seconds": seconds,
             "threads": 1,
@@ -441,11 +457,14 @@ fn measure(
     disk: Result<&Path, &str>,
     stream_iperf: bool,
     stage: &Stage<'_>,
-) -> Result<Vec<bench::Metric>, String> {
+) -> Result<Outcome, String> {
     let seconds = args.seconds;
-    match test {
+    let result = match test {
         Case::CpuSingle => bench::cpu(seconds, 1, stage),
         Case::CpuMulti => bench::cpu(seconds, threads, stage),
+        Case::CpuStability => {
+            return stability::run(args.stability_minutes * MINUTE_SECONDS, threads, stage);
+        }
         Case::CryptoSha256 => bench::crypto(seconds, "sha256", stage),
         Case::CryptoAes256Gcm => bench::crypto(seconds, "aes-256-gcm", stage),
         Case::RamRead => bench::memory(seconds, args.memory_mib, "read", stage),
@@ -464,5 +483,6 @@ fn measure(
             stream_iperf,
             stage,
         ),
-    }
+    };
+    result.map(Outcome::completed)
 }

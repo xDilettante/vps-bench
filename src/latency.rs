@@ -87,9 +87,7 @@ pub fn run(
                 Ok(rows) => match rows.next() {
                     Some(Ok(probe)) => {
                         parameters["resolved_address"] = json!(probe.address);
-                        Outcome::Completed {
-                            metrics: probe.metrics,
-                        }
+                        Outcome::completed(probe.metrics)
                     }
                     Some(Err(reason)) => Outcome::Failed { reason },
                     None => Outcome::Skipped {

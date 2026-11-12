@@ -17,6 +17,11 @@ pub const MEMORY_TRANSFER_MIB: u32 = 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
     EventsPerSecond,
+    EventsPerSecondP50,
+    EventsPerSecondP10,
+    FirstMinuteMedianEventsPerSecond,
+    LastMinuteMedianEventsPerSecond,
+    LastMinuteChangePercent,
     MibPerSecond,
     CpuStealPercent,
     Iops,
@@ -40,6 +45,11 @@ impl MetricKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::EventsPerSecond => "Событий/с",
+            Self::EventsPerSecondP50 => "Медиана, событий/с",
+            Self::EventsPerSecondP10 => "p10, событий/с",
+            Self::FirstMinuteMedianEventsPerSecond => "Медиана первой минуты, событий/с",
+            Self::LastMinuteMedianEventsPerSecond => "Медиана последней минуты, событий/с",
+            Self::LastMinuteChangePercent => "Изменение к первой минуте, %",
             Self::MibPerSecond => "Скорость, МиБ/с",
             Self::CpuStealPercent => "CPU steal, %",
             Self::Iops => "Операций/с (IOPS)",
@@ -63,7 +73,14 @@ impl MetricKind {
     pub fn higher_is_better(self) -> bool {
         matches!(
             self,
-            Self::EventsPerSecond | Self::MibPerSecond | Self::Iops | Self::MegabitsPerSecond
+            Self::EventsPerSecond
+                | Self::EventsPerSecondP50
+                | Self::EventsPerSecondP10
+                | Self::FirstMinuteMedianEventsPerSecond
+                | Self::LastMinuteMedianEventsPerSecond
+                | Self::MibPerSecond
+                | Self::Iops
+                | Self::MegabitsPerSecond
         )
     }
 }
@@ -239,25 +256,33 @@ pub fn sysbench_interval(line: &str, memory: bool) -> Option<f64> {
 }
 
 pub fn cpu(seconds: u32, threads: usize, stage: &Stage<'_>) -> Result<Vec<Metric>, String> {
-    let before = read_cpu_ticks();
     let mut observe = |line: &str| {
         if let Some(rate) = sysbench_interval(line, false) {
             stage.sample(rate, format!("{rate:.1} событий/с · за интервал"));
         }
     };
+    run_cpu(seconds, threads, stage.enabled().then_some(&mut observe))
+}
+
+pub fn run_cpu(
+    seconds: u32,
+    threads: usize,
+    observe: Option<&mut dyn FnMut(&str)>,
+) -> Result<Vec<Metric>, String> {
+    let before = read_cpu_ticks();
     let output = observed_command(
         "sysbench",
         [
             format!("--time={seconds}"),
             format!("--threads={threads}"),
-            format!("--report-interval={}", u8::from(stage.enabled())),
+            format!("--report-interval={}", u8::from(observe.is_some())),
             format!("--cpu-max-prime={CPU_PRIME}"),
             "cpu".into(),
             "run".into(),
         ],
         seconds + 10,
         None,
-        stage.enabled().then_some(&mut observe),
+        observe,
     )?;
     let mut metrics = vec![Metric::new(MetricKind::EventsPerSecond, cpu_rate(&output)?)];
     if let Some(percent) = before

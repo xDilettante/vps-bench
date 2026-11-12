@@ -152,6 +152,70 @@ fn live_sysbench_samples_are_separate_from_summary_metrics() {
 }
 
 #[test]
+fn stability_parses_timestamps_and_keeps_zero_throughput() {
+    use super::stability::{CpuSample, parse_sample};
+
+    assert_eq!(
+        parse_sample("[ 299s ] thds: 1 eps: 0.00 lat (ms,95%): 0.00"),
+        Some(CpuSample {
+            second: 299,
+            events_per_second: 0.0,
+        })
+    );
+    for line in [
+        "events per second: 700.00",
+        "[ 0s ] thds: 1 eps: 600.00",
+        "[ bad ] thds: 1 eps: 600.00",
+        "[ 60s ] thds: 1 eps: NaN",
+    ] {
+        assert_eq!(parse_sample(line), None);
+    }
+}
+
+#[test]
+fn stability_uses_observed_seconds_in_each_minute_and_nearest_rank_p10() {
+    use super::stability::{CpuSample, summarize};
+
+    let samples: Vec<_> = [
+        (1, 1000.0),
+        (60, 1200.0),
+        (61, 2000.0),
+        (240, 1600.0),
+        (241, 800.0),
+        (299, 600.0),
+    ]
+    .map(|(second, events_per_second)| CpuSample {
+        second,
+        events_per_second,
+    })
+    .into();
+    let (metrics, series) = summarize(samples.clone(), 300).unwrap();
+    let values: Vec<_> = metrics.iter().map(|metric| metric.value).collect();
+    assert_eq!(values[..4], [1100.0, 600.0, 1100.0, 700.0]);
+    assert!((values[4] - (-400.0 / 11.0)).abs() < 1e-10);
+    assert_eq!(series.samples, samples);
+    assert_eq!(series.first_minute_samples, 2);
+    assert_eq!(series.last_minute_samples, 2);
+    assert!(summarize(samples[..4].to_vec(), 300).is_err());
+}
+
+#[test]
+fn stability_graph_keeps_elapsed_time_and_marks_missing_buckets() {
+    use super::stability::{CpuSample, sparkline};
+
+    let samples =
+        [(1, 80.0), (2, 120.0), (21, 200.0)].map(|(second, events_per_second)| CpuSample {
+            second,
+            events_per_second,
+        });
+    assert_eq!(sparkline(&samples, 300), "График · ▁·█ · по 10 с · 100–200");
+    assert_eq!(
+        sparkline(&samples[..1], 600),
+        "График · ▄ · по 20 с · 80–80"
+    );
+}
+
+#[test]
 fn fio_uses_the_last_complete_report_for_final_metrics() {
     use super::bench::last_fio_report;
     let output = r#"{"jobs":[{"read":{"bw_bytes":100}}]}

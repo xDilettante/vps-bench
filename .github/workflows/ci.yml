@@ -23,6 +23,34 @@ jobs:
       - run: cargo test --locked
       - run: bash -n run.sh
       - run: cargo build --locked
+      - name: Check CPU stability graph, statistics and JSON
+        run: |
+          fixture_dir="$(mktemp -d)"
+          cat > "$fixture_dir/sysbench" <<'SH'
+          #!/bin/sh
+          set -eu
+          if [ "$1" = --version ]; then
+            printf 'sysbench 1.0.20\n'
+            exit 0
+          fi
+          test "$*" = '--time=300 --threads=1 --report-interval=1 --cpu-max-prime=20000 cpu run'
+          for second in $(seq 1 299); do
+            if [ "$second" -le 60 ]; then rate=1200
+            elif [ "$second" -le 240 ]; then rate=1000
+            else rate=800
+            fi
+            printf '[ %ss ] thds: 1 eps: %s.00 lat (ms,95%%): 0.50\n' "$second" "$rate"
+            if [ "$second" = 1 ] || [ "$second" = 241 ]; then sleep 0.2; fi
+          done
+          printf 'CPU speed:\n    events per second: 1000.00\n'
+          SH
+          chmod +x "$fixture_dir/sysbench"
+          PATH="$fixture_dir:$PATH" TERM=xterm-256color script -qefc 'stty cols 100 && target/debug/vps-bench run --only stability --threads 1 --output /tmp/vps-bench-stability.json' /tmp/vps-bench-stability-terminal.log < /dev/null
+          grep -qF 'График ·' /tmp/vps-bench-stability-terminal.log
+          grep -Eq 'Первая → последняя минута.*1200.00.*800.00.*-33.33%' /tmp/vps-bench-stability-terminal.log
+          jq -e '.measurements | length == 1 and all(.[]; .test == "cpu_stability" and .status == "completed" and .parameters.seconds == 300 and (.cpu_series.samples | length == 299) and .cpu_series.first_minute_samples == 60 and .cpu_series.last_minute_samples == 59 and any(.metrics[]; .kind == "events_per_second_p10" and .value == 800))' /tmp/vps-bench-stability.json
+          target/debug/vps-bench --color never compare /tmp/vps-bench-stability.json /tmp/vps-bench-stability.json > /tmp/vps-bench-stability-compare.log
+          grep -qF 'Близко +0.00%' /tmp/vps-bench-stability-compare.log
       - name: Check Crypto stages and comparison
         run: |
           openssl version

@@ -2,6 +2,7 @@ use crate::bench::{CPU_PRIME, Metric, MetricKind};
 use crate::disk::BlockDevice;
 use crate::host::Host;
 use crate::quality::rating_cell;
+use crate::stability::CpuSeries;
 use comfy_table::{Cell, Color, ContentArrangement, Table, modifiers, presets};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,7 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Section {
     Cpu,
+    Stability,
     Crypto,
     Memory,
     Disk,
@@ -24,8 +26,9 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ORDER: [Self; 6] = [
+    pub const ORDER: [Self; 7] = [
         Self::Cpu,
+        Self::Stability,
         Self::Crypto,
         Self::Memory,
         Self::Disk,
@@ -36,6 +39,7 @@ impl Section {
     pub fn heading(self, color: bool) -> String {
         let title = match self {
             Self::Cpu => "CPU · Процессор",
+            Self::Stability => "Стабильность · CPU",
             Self::Crypto => "Crypto · Криптография",
             Self::Memory => "RAM · Оперативная память",
             Self::Disk => "Диск · Накопитель",
@@ -55,6 +59,7 @@ impl Section {
 pub enum Case {
     CpuSingle,
     CpuMulti,
+    CpuStability,
     CryptoSha256,
     CryptoAes256Gcm,
     RamRead,
@@ -74,9 +79,10 @@ pub enum Case {
 }
 
 impl Case {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CpuSingle,
         Self::CpuMulti,
+        Self::CpuStability,
         Self::CryptoSha256,
         Self::CryptoAes256Gcm,
         Self::RamRead,
@@ -96,6 +102,7 @@ impl Case {
         match self {
             Self::CpuSingle => "Однопоточная производительность",
             Self::CpuMulti => "Многопоточная производительность",
+            Self::CpuStability => "Длительная нагрузка CPU",
             Self::CryptoSha256 => "SHA-256 · Хеширование",
             Self::CryptoAes256Gcm => "AES-256-GCM · Шифрование",
             Self::RamRead | Self::DiskSeqRead => "Последовательное чтение",
@@ -116,6 +123,7 @@ impl Case {
     pub fn section(self) -> Section {
         match self {
             Self::CpuSingle | Self::CpuMulti => Section::Cpu,
+            Self::CpuStability => Section::Stability,
             Self::CryptoSha256 | Self::CryptoAes256Gcm => Section::Crypto,
             Self::RamRead | Self::RamWrite => Section::Memory,
             Self::DiskSeqWrite
@@ -139,6 +147,12 @@ impl Case {
             Section::Cpu => format!(
                 "sysbench cpu · простые числа до {CPU_PRIME} · {} · {seconds} с",
                 threads(&parameters["threads"])
+            ),
+            Section::Stability => format!(
+                "sysbench cpu · простые числа до {} · {} · {seconds} с · шаг {} с",
+                amount("cpu_max_prime"),
+                threads(&parameters["threads"]),
+                amount("sample_seconds")
             ),
             Section::Crypto => {
                 let mode = if parameters["aead"].as_bool() == Some(true) {
@@ -211,7 +225,7 @@ impl Case {
 
     pub fn tool(self) -> &'static str {
         match self.section() {
-            Section::Cpu | Section::Memory => "sysbench",
+            Section::Cpu | Section::Stability | Section::Memory => "sysbench",
             Section::Crypto => "openssl",
             Section::Disk => "fio",
             Section::Latency => "ping",
@@ -267,9 +281,19 @@ impl Measurement {
     }
 
     fn workload(&self) -> String {
-        self.workload
+        let workload = self
+            .workload
             .as_deref()
-            .map_or_else(|| self.test.workload(&self.parameters), clean)
+            .map_or_else(|| self.test.workload(&self.parameters), clean);
+        if let Outcome::Completed {
+            cpu_series: Some(series),
+            ..
+        } = &self.outcome
+        {
+            format!("{workload}\n{}", series.coverage())
+        } else {
+            workload
+        }
     }
 }
 
@@ -283,21 +307,27 @@ fn test_label(test: Case, target: Option<&str>) -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
-    Completed { metrics: Vec<Metric> },
-    Skipped { reason: String },
-    Failed { reason: String },
-}
-
-impl From<Result<Vec<Metric>, String>> for Outcome {
-    fn from(result: Result<Vec<Metric>, String>) -> Self {
-        match result {
-            Ok(metrics) => Self::Completed { metrics },
-            Err(reason) => Self::Failed { reason },
-        }
-    }
+    Completed {
+        metrics: Vec<Metric>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_series: Option<CpuSeries>,
+    },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 impl Outcome {
+    pub fn completed(metrics: Vec<Metric>) -> Self {
+        Self::Completed {
+            metrics,
+            cpu_series: None,
+        }
+    }
+
     fn status(&self) -> (&'static str, Color) {
         match self {
             Self::Completed { .. } => ("Готово", Color::Green),
@@ -315,7 +345,7 @@ impl Outcome {
 
     fn metrics(&self) -> &[Metric] {
         match self {
-            Self::Completed { metrics } => metrics,
+            Self::Completed { metrics, .. } => metrics,
             _ => &[],
         }
     }
@@ -390,7 +420,7 @@ impl Report {
 
     pub fn section_context(&self, section: Section) -> Option<String> {
         match section {
-            Section::Cpu => Some(format!(
+            Section::Cpu | Section::Stability => Some(format!(
                 "{} · доступно {} vCPU",
                 clean(self.host.cpu_model.as_deref().unwrap_or(&self.host.arch)),
                 self.host.available_vcpus
@@ -783,7 +813,7 @@ fn add_comparison(
     }
 }
 
-fn metric_value(metrics: &[Metric], kind: MetricKind) -> Option<f64> {
+pub fn metric_value(metrics: &[Metric], kind: MetricKind) -> Option<f64> {
     metrics
         .iter()
         .find(|metric| metric.kind == kind)
@@ -804,7 +834,10 @@ fn comparison_cell(
 }
 
 pub fn assessment(kind: MetricKind, before: f64, after: f64) -> Cell {
-    if matches!(kind, MetricKind::PacketsSent | MetricKind::PacketsReceived) {
+    if matches!(
+        kind,
+        MetricKind::PacketsSent | MetricKind::PacketsReceived | MetricKind::LastMinuteChangePercent
+    ) {
         return Cell::new("—");
     }
     let diff = after - before;
@@ -878,6 +911,9 @@ pub fn assessment(kind: MetricKind, before: f64, after: f64) -> Cell {
 fn metric_cell(kind: MetricKind, value: f64) -> Cell {
     if matches!(kind, MetricKind::PacketsSent | MetricKind::PacketsReceived) {
         return Cell::new(format!("{value:.0}"));
+    }
+    if kind == MetricKind::LastMinuteChangePercent {
+        return Cell::new(format!("{value:+.2}"));
     }
     let cell = Cell::new(format_value(value));
     if kind != MetricKind::PacketLossPercent {

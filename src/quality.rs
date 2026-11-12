@@ -89,7 +89,14 @@ fn thresholds(test: Case, parameters: &Value, kind: MetricKind) -> Option<(f64, 
     use MetricKind::*;
 
     Some(match (test, kind) {
-        (CpuSingle | CpuMulti, EventsPerSecond) => {
+        (CpuSingle | CpuMulti, EventsPerSecond)
+        | (
+            CpuStability,
+            EventsPerSecondP50
+            | EventsPerSecondP10
+            | FirstMinuteMedianEventsPerSecond
+            | LastMinuteMedianEventsPerSecond,
+        ) => {
             let workers = parameters["threads"].as_u64().filter(|&n| n > 0)? as f64;
             (500.0 * workers, 1200.0 * workers)
         }
