@@ -1,8 +1,10 @@
 use crate::bench::{Metric, MetricKind, capture, timed_command};
 use crate::progress::{RunProgress, Stage};
-use crate::report::{Case, Measurement, Outcome};
+use crate::report::{Case, Measurement, Outcome, metric_value};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +22,72 @@ pub struct Load<'a> {
 pub struct Probe {
     pub address: Option<String>,
     pub metrics: Vec<Metric>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadRttP95 {
+    pub idle_ms: Option<f64>,
+    pub loaded_ms: Option<f64>,
+    pub delta_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn annotate_rtt_p95_load(measurements: &mut [Measurement]) {
+    let idle: BTreeMap<_, _> = measurements
+        .iter()
+        .filter(|row| row.test == Case::PingIdle)
+        .filter_map(|row| row.target.as_deref().map(|target| (target, row)))
+        .collect();
+    let summaries: Vec<_> = measurements
+        .iter()
+        .map(|row| {
+            let target = row.target.as_deref()?;
+            (matches!(row.test, Case::PingUpload | Case::PingDownload)
+                && row.parameters["load"].is_object())
+            .then(|| p95_pair(idle.get(target).copied(), row))
+        })
+        .collect();
+    for (row, summary) in measurements.iter_mut().zip(summaries) {
+        row.rtt_p95_load = summary;
+    }
+}
+
+fn p95_pair(idle: Option<&Measurement>, loaded: &Measurement) -> LoadRttP95 {
+    let p95 = |row: &Measurement| {
+        metric_value(row.outcome.metrics(), MetricKind::RttP95Ms)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let idle_ms = idle.and_then(p95);
+    let loaded_ms = p95(loaded);
+    let delta = (|| {
+        let (idle, idle_rtt) = idle.zip(idle_ms).ok_or("Нет p95 в простое")?;
+        let loaded_rtt = loaded_ms.ok_or("Нет p95 под нагрузкой")?;
+        let idle_ip = resolved_ip(idle).ok_or("IP узла неизвестен")?;
+        let loaded_ip = resolved_ip(loaded).ok_or("IP узла неизвестен")?;
+        if idle_ip != loaded_ip {
+            return Err("Разные IP узла");
+        }
+        if !["count", "interval_ms"].into_iter().all(|key| {
+            let setting = idle.parameters[key].as_u64();
+            setting.is_some_and(|n| n > 0) && setting == loaded.parameters[key].as_u64()
+        }) {
+            return Err("Разные параметры ICMP");
+        }
+        Ok(loaded_rtt - idle_rtt)
+    })();
+    LoadRttP95 {
+        idle_ms,
+        loaded_ms,
+        delta_ms: delta.ok(),
+        reason: delta.err().map(str::to_owned),
+    }
+}
+
+fn resolved_ip(row: &Measurement) -> Option<(IpAddr, &str)> {
+    let address = row.parameters["resolved_address"].as_str()?;
+    let (ip, scope) = address.split_once('%').unwrap_or((address, ""));
+    Some((ip.parse().ok()?, scope))
 }
 
 pub fn run(
@@ -111,6 +179,7 @@ pub fn run(
                 .map(|measurement| (measurement.target.as_deref(), &measurement.outcome)),
         );
     }
+    annotate_rtt_p95_load(&mut measurements);
     measurements
 }
 

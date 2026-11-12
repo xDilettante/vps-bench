@@ -1,6 +1,7 @@
 use crate::bench::{CPU_PRIME, Metric, MetricKind};
 use crate::disk::BlockDevice;
 use crate::host::Host;
+use crate::latency::{LoadRttP95, annotate_rtt_p95_load};
 use crate::quality::rating_cell;
 use crate::stability::CpuSeries;
 use comfy_table::{Cell, Color, ContentArrangement, Table, modifiers, presets};
@@ -264,6 +265,8 @@ pub struct Measurement {
     pub target: Option<String>,
     pub parameters: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_p95_load: Option<LoadRttP95>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workload: Option<String>,
     #[serde(flatten)]
     pub outcome: Outcome,
@@ -274,6 +277,7 @@ impl Measurement {
         Self {
             test,
             target,
+            rtt_p95_load: None,
             workload: Some(test.workload(&parameters)),
             parameters,
             outcome,
@@ -343,7 +347,7 @@ impl Outcome {
         }
     }
 
-    fn metrics(&self) -> &[Metric] {
+    pub(crate) fn metrics(&self) -> &[Metric] {
         match self {
             Self::Completed { metrics, .. } => metrics,
             _ => &[],
@@ -397,12 +401,14 @@ impl Report {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let read = || -> Result<Self, Box<dyn std::error::Error>> {
-            let report: Self = serde_json::from_reader(std::io::BufReader::new(File::open(path)?))?;
+            let mut report: Self =
+                serde_json::from_reader(std::io::BufReader::new(File::open(path)?))?;
             if report.schema_version != SCHEMA_VERSION {
                 return Err(
                     format!("версия схемы {} не поддерживается", report.schema_version).into(),
                 );
             }
+            annotate_rtt_p95_load(&mut report.measurements);
             Ok(report)
         };
         read().map_err(|err| format!("{}: {err}", path.display()))
@@ -523,6 +529,9 @@ impl Report {
             if let Some(context) = self.section_context(section) {
                 println!("  {context}");
             }
+            if section == Section::Latency {
+                print_rtt_p95_load(self, baseline, color);
+            }
             let headers: &[&str] = if baseline.is_some() {
                 &[
                     "Замер и параметры",
@@ -594,6 +603,134 @@ fn add_measurement(table: &mut Table, row: &Measurement, baseline: Option<&Repor
         }
         table.add_row(cells);
     }
+}
+
+fn print_rtt_p95_load(report: &Report, baseline: Option<&Report>, color: ColorMode) {
+    let mut rows: Vec<_> = report
+        .measurements
+        .iter()
+        .filter_map(|row| row.rtt_p95_load.as_ref().map(|summary| (row, summary)))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|(row, _)| (row.target.as_deref(), row.test));
+    let mut headers = vec!["Узел", "Фаза", "Простой", "Нагрузка", "Δ p95"];
+    if baseline.is_some() {
+        headers.push("Δ к эталону");
+    }
+    let mut table = table(color, &headers);
+    for (row, summary) in rows {
+        let target = row.target.as_deref();
+        let mut cells = vec![
+            Cell::new(target.map_or_else(String::new, clean)),
+            Cell::new(if row.test == Case::PingUpload {
+                "Отправка TCP"
+            } else {
+                "Приём TCP"
+            }),
+            Cell::new(rtt_ms(summary.idle_ms)),
+            Cell::new(rtt_ms(summary.loaded_ms)),
+            rtt_delta_cell(summary),
+        ];
+        if let Some(baseline) = baseline {
+            cells.push(rtt_delta_comparison(
+                baseline.measurement(row.test, target),
+                Some(row),
+            ));
+        }
+        table.add_row(cells);
+    }
+    println!("  RTT p95, мс · Δ = нагрузка − простой\n{table}\n");
+}
+
+fn print_rtt_p95_comparison(left: &Report, right: &Report, color: ColorMode) {
+    let tests: BTreeSet<_> = left
+        .measurements
+        .iter()
+        .chain(&right.measurements)
+        .filter(|row| row.rtt_p95_load.is_some())
+        .map(|row| (row.target.as_deref(), row.test))
+        .collect();
+    if tests.is_empty() {
+        return;
+    }
+    let mut table = table(color, &["Узел и фаза", "VPS A", "VPS B", "Δ B − Δ A"]);
+    for (target, test) in tests {
+        let a = left.measurement(test, target);
+        let b = right.measurement(test, target);
+        table.add_row([
+            Cell::new(test_label(test, target)),
+            rtt_pair_cell(a),
+            rtt_pair_cell(b),
+            rtt_delta_comparison(a, b),
+        ]);
+    }
+    println!("  RTT p95, мс · Δ = нагрузка − простой\n{table}\n");
+}
+
+fn rtt_ms(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".into(), |ms| format!("{ms:.3}"))
+}
+
+fn rtt_delta_style(value: f64) -> (String, Color) {
+    let text = format!("{value:+.3}");
+    match text.as_str() {
+        "+0.000" | "-0.000" => ("0.000".into(), Color::Cyan),
+        _ if value > 0.0 => (text, Color::Red),
+        _ => (text, Color::Green),
+    }
+}
+
+fn rtt_delta_cell(summary: &LoadRttP95) -> Cell {
+    match summary.delta_ms {
+        Some(value) => {
+            let (text, color) = rtt_delta_style(value);
+            Cell::new(text).fg(color)
+        }
+        None => Cell::new(summary.reason.as_deref().unwrap_or("—")).fg(Color::Yellow),
+    }
+}
+
+fn rtt_pair_cell(row: Option<&Measurement>) -> Cell {
+    let Some(summary) = row.and_then(|row| row.rtt_p95_load.as_ref()) else {
+        return Cell::new("—");
+    };
+    let pair = format!(
+        "{} → {}",
+        rtt_ms(summary.idle_ms),
+        rtt_ms(summary.loaded_ms)
+    );
+    match summary.delta_ms {
+        Some(value) => {
+            let (text, color) = rtt_delta_style(value);
+            Cell::new(format!("{pair}\nΔ {text}")).fg(color)
+        }
+        None => Cell::new(format!(
+            "{pair}\n{}",
+            summary.reason.as_deref().unwrap_or("—")
+        ))
+        .fg(Color::Yellow),
+    }
+}
+
+fn rtt_delta_comparison(a: Option<&Measurement>, b: Option<&Measurement>) -> Cell {
+    let Some((a, b)) = a.zip(b) else {
+        return Cell::new("—");
+    };
+    let delta = |row: &Measurement| row.rtt_p95_load.as_ref().and_then(|r| r.delta_ms);
+    let Some((before, after)) = delta(a).zip(delta(b)) else {
+        return Cell::new("—");
+    };
+    if !comparable_parameters(a.test, &a.parameters, &b.parameters) {
+        return Cell::new("Разные параметры").fg(Color::Yellow);
+    }
+    let difference = after - before;
+    if !difference.is_finite() {
+        return Cell::new("—");
+    }
+    let (text, color) = rtt_delta_style(difference);
+    Cell::new(text).fg(color)
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -723,6 +860,9 @@ pub fn compare(left: &Report, right: &Report, color: ColorMode) {
                     println!("  {name} · {context}");
                 }
             }
+        }
+        if section == Section::Latency {
+            print_rtt_p95_comparison(left, right, color);
         }
         let mut table = table(
             color,

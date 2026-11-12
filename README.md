@@ -13,7 +13,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, 
 | Crypto | Скорость SHA-256 и шифрования AES-256-GCM в МиБ/с |
 | Диск | Последовательная скорость, случайные IOPS и задержки p50/p95/p99, опционально `fdatasync` |
 | TCP | Входящая и исходящая скорость, повторные передачи и средний RTT при наличии данных |
-| ICMP | RTT p50/p95/p99, потери и счётчики пакетов для каждого узла в простое, при исходящей и входящей нагрузке |
+| ICMP | RTT p50/p95/p99 и потери в трёх фазах, изменение RTT p95 при отправке и приёме для каждого узла |
 
 ## Запуск из PowerShell по SSH
 
@@ -22,7 +22,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, 
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
@@ -32,7 +32,7 @@ ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.gith
 Короткий прогон показывает CPU, Crypto, память и диск. В Ubuntu для него нужны `curl`, `sysbench`, `openssl` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
 ```
 
 В терминале шкала времени и цветная оценка замера показаны на разных строках. Полоса обновляется с каждым замером и меняет цвет при пересечении порога. Для CPU, Crypto, RAM и TCP используется скорость за интервал, для диска — скорость последовательного I/O или случайные IOPS с начала этапа, для ICMP — RTT последнего ответа. Для живой скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее).
@@ -46,7 +46,7 @@ wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubuserc
 Режим `--only stability` нагружает CPU одним непрерывным прогоном `sysbench` и обновляет график по секундным отсчётам. Столбец графика показывает среднюю скорость за указанный интервал. Рядом виден диапазон скоростей на графике. В PowerShell можно запустить пятиминутный тест в один поток.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.9.0/run.sh | bash -s -- run --only stability --stability-minutes 5 --threads 1'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --only stability --stability-minutes 5 --threads 1'
 ```
 
 `--stability-minutes` принимает целое число от 5 до 10, по умолчанию 5. Если опустить `--threads`, используются доступные vCPU. Итог показывает медиану и p10 скорости по всем отсчётам, медианы первой и последней минут и процент изменения. p10 берётся методом ближайшего ранга. Для каждой минуты видно покрытие из 60 отсчётов. Sysbench может завершиться до печати последнего отсчёта, поэтому в статистику входят только полученные значения. [Промежуточная статистика sysbench](https://github.com/akopytov/sysbench)
@@ -92,6 +92,12 @@ tar -xzf vps-bench-linux-x86_64.tar.gz
 ```
 
 `compare` читает оба отчёта с одной машины и показывает изменения относительно первого. Потери сравниваются в процентных пунктах. Сопоставляются одинаковые фазы для одного узла. Разный разрешённый IP, число проб или профиль нагрузки отмечаются как разные параметры. Отчёты 0.1.0 можно использовать для прежних тестов CPU, RAM, диска и TCP.
+
+При запуске с `--ping-target` и `--iperf-host` сводная таблица показывает RTT p95 в простое и под нагрузкой для каждого узла, отдельно при отправке и приёме TCP. `Δ p95` равна p95 под нагрузкой минус p95 в простое. Красный цвет означает рост, зелёный — снижение.
+
+В JSON поле `rtt_p95_load` в измерениях `ping_upload` и `ping_download` содержит `idle_ms`, `loaded_ms` и `delta_ms`. Для расчёта нужны оба p95, одинаковый разрешённый IP узла, число проб и интервал. Если пара недоступна, `delta_ms` равна `null`, а поле `reason` содержит причину. При чтении старых отчётов сводка строится по сохранённым замерам.
+
+В `compare` колонка `Δ B − Δ A` показывает, на сколько миллисекунд изменение под нагрузкой на VPS B отличается от VPS A при одинаковых параметрах. `--baseline` выводит ту же разницу относительно выбранного эталона.
 
 В цветной шкале центр соответствует эталону, левая сторона показывает ухудшение, правая — улучшение. Рост скорости и снижение задержки заполняют правую сторону. Рядом выводится точная разница и текстовая оценка. «Близко» означает изменение в пределах 5% для относительных величин или 0,1 процентного пункта для потерь и CPU steal. Полная сторона шкалы соответствует 50% или 5 процентным пунктам. При нулевом эталоне для остальных метрик видны направление и абсолютная разница.
 

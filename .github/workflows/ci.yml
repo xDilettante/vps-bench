@@ -74,4 +74,8 @@ jobs:
           grep -Eq 'Итог.*(Плохо|Норма|Хорошо).*потери [0-9.]+' /tmp/vps-bench-terminal.log
           grep -qF 'Сеть · Задержка и потери ICMP' /tmp/vps-bench-terminal.log
           grep -qF '≤100 / ≤30' /tmp/vps-bench-terminal.log
+          grep -qF 'RTT p95, мс · Δ = нагрузка − простой' /tmp/vps-bench-terminal.log
           jq -e '.measurements | length == 3 and all(.[]; .status == "completed" and (.workload | startswith("ping")) and any(.metrics[]; .kind == "rtt_p99_ms"))' /tmp/vps-bench.json
+          jq -e '[.measurements[].rtt_p95_load | select(. != null)] | length == 2 and all(.[]; (.delta_ms | type) == "number" and ((.delta_ms - .loaded_ms + .idle_ms) | fabs) < 0.000001)' /tmp/vps-bench.json
+          target/debug/vps-bench --color never compare /tmp/vps-bench.json /tmp/vps-bench.json > /tmp/vps-bench-rtt-compare.log
+          grep -qF 'Δ B − Δ A' /tmp/vps-bench-rtt-compare.log

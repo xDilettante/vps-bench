@@ -137,6 +137,94 @@ fn total_loss_has_no_rtt_and_load_needs_a_nonzero_live_interval() {
     assert!(has_load("[  5] 0.00-1.00 sec 128 MBytes 1.00 Gbits/sec"));
 }
 
+fn p95_measurement(
+    test: super::report::Case,
+    target: &str,
+    address: Option<&str>,
+    rtt: Option<f64>,
+) -> super::report::Measurement {
+    use super::bench::{Metric, MetricKind::RttP95Ms};
+    use super::report::{Case, Measurement, Outcome};
+
+    let mut parameters = json!({"count": 100, "interval_ms": 200, "resolved_address": address});
+    if matches!(test, Case::PingUpload | Case::PingDownload) {
+        parameters["load"] =
+            json!({"host": "load.example", "port": 5201, "streams": 4, "seconds": 28});
+    }
+    let metrics = rtt
+        .into_iter()
+        .map(|value| Metric::new(RttP95Ms, value))
+        .collect();
+    Measurement::new(
+        test,
+        Some(target.into()),
+        parameters,
+        Outcome::completed(metrics),
+    )
+}
+
+#[test]
+fn rtt_p95_load_pairs_each_direction_with_its_own_target() {
+    use super::latency::{LoadRttP95, annotate_rtt_p95_load};
+    use super::report::Case::*;
+
+    let address = Some("2001:db8::1");
+    let mut rows = [
+        p95_measurement(PingUpload, "b", address, Some(100.0)),
+        p95_measurement(PingIdle, "a", address, Some(8.0)),
+        p95_measurement(PingDownload, "a", address, Some(6.0)),
+        p95_measurement(PingIdle, "b", address, Some(10.0)),
+        p95_measurement(PingUpload, "a", Some("2001:0db8::1"), Some(74.0)),
+    ];
+    annotate_rtt_p95_load(&mut rows);
+    assert_eq!(rows[0].rtt_p95_load.as_ref().unwrap().delta_ms, Some(90.0));
+    assert_eq!(rows[2].rtt_p95_load.as_ref().unwrap().delta_ms, Some(-2.0));
+    assert_eq!(
+        rows[4].rtt_p95_load,
+        Some(LoadRttP95 {
+            idle_ms: Some(8.0),
+            loaded_ms: Some(74.0),
+            delta_ms: Some(66.0),
+            reason: None,
+        })
+    );
+    assert!(rows[1].rtt_p95_load.is_none());
+}
+
+#[test]
+fn rtt_p95_load_keeps_missing_or_unpaired_values_explicit() {
+    use super::latency::annotate_rtt_p95_load;
+    use super::report::Case::*;
+
+    let address = Some("192.0.2.1");
+    let mut rows = [
+        p95_measurement(PingIdle, "a", address, Some(10.0)),
+        p95_measurement(PingUpload, "a", Some("192.0.2.2"), Some(20.0)),
+        p95_measurement(PingDownload, "a", address, None),
+        p95_measurement(PingUpload, "b", address, Some(25.0)),
+        p95_measurement(PingDownload, "a", address, Some(20.0)),
+        p95_measurement(PingUpload, "a", None, Some(20.0)),
+        p95_measurement(PingUpload, "a", address, Some(30.0)),
+    ];
+    rows[4].parameters["count"] = json!(50);
+    rows[6].parameters.as_object_mut().unwrap().remove("load");
+    annotate_rtt_p95_load(&mut rows);
+
+    for (index, reason) in [
+        (1, "Разные IP узла"),
+        (2, "Нет p95 под нагрузкой"),
+        (3, "Нет p95 в простое"),
+        (4, "Разные параметры ICMP"),
+        (5, "IP узла неизвестен"),
+    ] {
+        let result = rows[index].rtt_p95_load.as_ref().unwrap();
+        assert_eq!(result.delta_ms, None);
+        assert_eq!(result.reason.as_deref(), Some(reason));
+    }
+    assert_eq!(rows[1].rtt_p95_load.as_ref().unwrap().loaded_ms, Some(20.0));
+    assert!(rows[6].rtt_p95_load.is_none());
+}
+
 #[test]
 fn live_sysbench_samples_are_separate_from_summary_metrics() {
     use super::bench::sysbench_interval;
