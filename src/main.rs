@@ -1,4 +1,5 @@
 mod bench;
+mod disk;
 mod host;
 mod latency;
 mod progress;
@@ -7,10 +8,10 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use host::Host;
 use progress::{RunProgress, Stage};
-use report::{Case, ColorMode, Measurement, Outcome, Report, clean};
+use report::{Case, ColorMode, Measurement, Outcome, Report, Section, clean};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -39,15 +40,6 @@ enum Action {
         baseline: PathBuf,
         candidate: PathBuf,
     },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Section {
-    Cpu,
-    Memory,
-    Disk,
-    Network,
-    Latency,
 }
 
 #[derive(Args)]
@@ -194,17 +186,22 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     let threads = args
         .threads
         .map_or(report.host.available_vcpus, |n| n as usize);
-    let profiles: Vec<_> = Case::ALL
-        .into_iter()
-        .filter_map(|test| {
-            let (section, parameters) = profile(test, &args, threads);
-            (args.only.contains(&section) && (test != Case::DiskSync || args.disk_sync))
-                .then_some((test, section, parameters))
-        })
-        .collect();
+    let profiles = Section::ORDER.map(|section| {
+        let tests = Case::ALL
+            .into_iter()
+            .filter(|test| {
+                test.section() == section
+                    && args.only.contains(&section)
+                    && (*test != Case::DiskSync || args.disk_sync)
+            })
+            .map(|test| (test, profile(test, &args, threads)))
+            .collect::<Vec<_>>();
+        (section, tests)
+    });
+    let total = profiles.iter().map(|(_, tests)| tests.len()).sum::<usize>();
     let mut progress = RunProgress::new(
         &report.host.label,
-        profiles.len() + if latency { 3 } else { 0 },
+        total + if latency { 3 } else { 0 },
         color,
         args.no_progress,
     );
@@ -243,25 +240,15 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         && bench::command("iperf3", ["--help"], 3, None)
             .is_ok_and(|help| help.split_whitespace().any(|arg| arg == "--json-stream"));
 
-    if latency {
-        let load = args.iperf_host.as_deref().map(|host| latency::Load {
-            host,
-            port: args.iperf_port,
-            streams: args.streams,
-        });
-        report.measurements.extend(latency::run(
-            &args.ping_targets,
-            args.ping_count,
-            load,
-            &unavailable,
-            &mut progress,
-        ));
-    }
-
     let disk = if args.only.contains(&Section::Disk) && !unavailable.contains_key("fio") {
         let mut prepare = || -> Result<_, std::io::Error> {
             let dir = fs::canonicalize(&args.disk_dir)?;
             report.disk_directory = Some(dir.display().to_string());
+            if let Some(volume) = disk::Volume::read(&dir) {
+                report.disk_source = Some(volume.source);
+                report.disk_filesystem = Some(volume.filesystem);
+                report.disk_device = volume.device;
+            }
             if let Ok(stat) = bench::command(
                 "stat",
                 [
@@ -274,7 +261,11 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
                 None,
             ) {
                 let mut fields = stat.split_whitespace();
-                report.disk_filesystem = fields.next().map(str::to_owned);
+                if let Some(filesystem) = fields.next() {
+                    report
+                        .disk_filesystem
+                        .get_or_insert_with(|| filesystem.to_owned());
+                }
                 let available_bytes = fields
                     .next()
                     .and_then(|n| n.parse::<u64>().ok())
@@ -298,51 +289,73 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     };
 
     let mut disk_written = false;
-    for (test, section, parameters) in profiles {
-        let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
-        let stage = progress.start(test.label(), planned);
-        let outcome = if let Some(reason) = unavailable.get(test.tool()) {
-            Outcome::Failed {
-                reason: reason.clone(),
-            }
-        } else if section == Section::Network && args.iperf_host.is_none() {
-            Outcome::Skipped {
-                reason: "Укажите --iperf-host".into(),
-            }
-        } else if section == Section::Memory
-            && host::memory_headroom_mib().is_some_and(|mib| mib < u64::from(args.memory_mib) + 32)
-        {
-            Outcome::Skipped {
-                reason: format!(
-                    "Для буфера {} МиБ и запаса 32 МиБ мало свободной RAM",
-                    args.memory_mib
-                ),
-            }
-        } else if section == Section::Disk && test != Case::DiskSeqWrite && !disk_written {
-            Outcome::Skipped {
-                reason: "Тестовый файл не подготовлен".into(),
-            }
-        } else {
-            measure(
-                test,
-                &args,
-                threads,
-                disk.as_ref().map(|dir| dir.path()).map_err(String::as_str),
-                stream_iperf,
-                &stage,
-            )
-            .into()
-        };
-        if test == Case::DiskSeqWrite {
-            disk_written = matches!(outcome, Outcome::Completed { .. });
+    for (section, tests) in profiles {
+        if section == Section::Latency && latency {
+            progress.section(
+                section,
+                Some(&format!("Узлы {}", args.ping_targets.join(", "))),
+            );
+            let load = args.iperf_host.as_deref().map(|host| latency::Load {
+                host,
+                port: args.iperf_port,
+                streams: args.streams,
+            });
+            report.measurements.extend(latency::run(
+                &args.ping_targets,
+                args.ping_count,
+                load,
+                &unavailable,
+                &mut progress,
+            ));
         }
-        stage.finish([&outcome]);
-        report.measurements.push(Measurement {
-            test,
-            target: None,
-            parameters,
-            outcome,
-        });
+        if tests.is_empty() {
+            continue;
+        }
+        progress.section(section, report.section_context(section).as_deref());
+        for (test, parameters) in tests {
+            let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
+            let stage = progress.start(test.label(), &test.workload(&parameters), planned);
+            let outcome = if let Some(reason) = unavailable.get(test.tool()) {
+                Outcome::Failed {
+                    reason: reason.clone(),
+                }
+            } else if section == Section::Network && args.iperf_host.is_none() {
+                Outcome::Skipped {
+                    reason: "Укажите --iperf-host".into(),
+                }
+            } else if section == Section::Memory
+                && host::memory_headroom_mib()
+                    .is_some_and(|mib| mib < u64::from(args.memory_mib) + 32)
+            {
+                Outcome::Skipped {
+                    reason: format!(
+                        "Для буфера {} МиБ и запаса 32 МиБ мало свободной RAM",
+                        args.memory_mib
+                    ),
+                }
+            } else if section == Section::Disk && test != Case::DiskSeqWrite && !disk_written {
+                Outcome::Skipped {
+                    reason: "Тестовый файл не подготовлен".into(),
+                }
+            } else {
+                measure(
+                    test,
+                    &args,
+                    threads,
+                    disk.as_ref().map(|dir| dir.path()).map_err(String::as_str),
+                    stream_iperf,
+                    &stage,
+                )
+                .into()
+            };
+            if test == Case::DiskSeqWrite {
+                disk_written = matches!(outcome, Outcome::Completed { .. });
+            }
+            stage.finish([&outcome]);
+            report
+                .measurements
+                .push(Measurement::new(test, None, parameters, outcome));
+        }
     }
     if let Ok(dir) = disk
         && let Err(err) = dir.close()
@@ -361,37 +374,27 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     Ok(report.success())
 }
 
-fn profile(test: Case, args: &RunArgs, threads: usize) -> (Section, Value) {
+fn profile(test: Case, args: &RunArgs, threads: usize) -> Value {
     let seconds = args.seconds;
     let size = args.disk_mib;
     match test {
-        Case::CpuSingle => (Section::Cpu, json!({"seconds": seconds, "threads": 1})),
-        Case::CpuMulti => (
-            Section::Cpu,
-            json!({"seconds": seconds, "threads": threads}),
-        ),
-        Case::RamRead | Case::RamWrite => (
-            Section::Memory,
-            json!({"seconds": seconds, "block_mib": args.memory_mib, "threads": 1}),
-        ),
-        Case::DiskSeqWrite => (
-            Section::Disk,
-            json!({"size_mib": size, "block_kib": 1024, "iodepth": 1, "direct": true}),
-        ),
-        Case::DiskSeqRead => (
-            Section::Disk,
-            json!({"seconds": seconds, "size_mib": size, "block_kib": 1024, "iodepth": 1, "direct": true}),
-        ),
-        Case::DiskRandRead | Case::DiskRandWrite | Case::DiskSync => (
-            Section::Disk,
-            json!({"seconds": seconds, "size_mib": size, "block_kib": 4, "iodepth": 1, "direct": test != Case::DiskSync}),
-        ),
+        Case::CpuSingle => json!({"seconds": seconds, "threads": 1}),
+        Case::CpuMulti => json!({"seconds": seconds, "threads": threads}),
+        Case::RamRead | Case::RamWrite => {
+            json!({"seconds": seconds, "block_mib": args.memory_mib, "threads": 1})
+        }
+        Case::DiskSeqWrite => {
+            json!({"size_mib": size, "block_kib": 1024, "iodepth": 1, "direct": true})
+        }
+        Case::DiskSeqRead => {
+            json!({"seconds": seconds, "size_mib": size, "block_kib": 1024, "iodepth": 1, "direct": true})
+        }
+        Case::DiskRandRead | Case::DiskRandWrite | Case::DiskSync => {
+            json!({"seconds": seconds, "size_mib": size, "block_kib": 4, "iodepth": 1, "direct": test != Case::DiskSync})
+        }
         _ => {
             let streams = network_streams(test, args.streams);
-            (
-                Section::Network,
-                json!({"seconds": seconds, "host": args.iperf_host, "port": args.iperf_port, "streams": streams}),
-            )
+            json!({"seconds": seconds, "host": args.iperf_host, "port": args.iperf_port, "streams": streams})
         }
     }
 }

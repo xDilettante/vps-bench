@@ -145,3 +145,37 @@ fn iperf_stream_keeps_interval_and_receiver_totals_distinct() {
     assert_eq!(iperf_metrics(&report).unwrap()[0].value, 780.0);
     assert!(iperf_stream_report(interval).is_err());
 }
+
+#[test]
+fn workload_descriptions_explain_actual_test_settings() {
+    use super::report::Case;
+
+    let cpu = Case::CpuSingle.workload(&json!({"threads": 1, "seconds": 15}));
+    assert!(cpu.contains("простые числа до 20000"));
+    assert!(cpu.contains("1 поток"));
+    let disk = Case::DiskRandRead.workload(&json!({
+        "block_kib": 4, "size_mib": 512, "iodepth": 1, "direct": true, "seconds": 15,
+    }));
+    assert!(disk.contains("блок 4 КиБ") && disk.contains("очередь 1"));
+    assert!(disk.contains("прямой I/O") && disk.contains("файл 512 МиБ"));
+    let tcp = Case::NetDownMulti.workload(&json!({
+        "host": "::1", "port": 5201, "streams": 4, "seconds": 15,
+    }));
+    assert!(tcp.contains("[::1]:5201") && tcp.contains("4 потока"));
+}
+
+#[test]
+fn disk_device_metadata_matches_the_measured_mount_by_device_number() {
+    use super::disk::BlockDevice;
+
+    let devices = json!({"blockdevices": [
+        {"name":"sda","maj:min":"8:0","type":"disk","size":1000,"rota":true},
+        {"name":"vdb1","maj:min":"252:17","type":"part","size":"2048","rota":0,"tran":null},
+    ]});
+    let device = BlockDevice::find(&devices, "252:17").unwrap();
+    let value = serde_json::to_value(device).unwrap();
+    assert_eq!(value["name"], "vdb1");
+    assert_eq!(value["size_bytes"], 2048);
+    assert_eq!(value["rotational"], false);
+    assert!(BlockDevice::find(&devices, "0:83").is_none());
+}

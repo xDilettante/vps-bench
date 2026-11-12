@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 const MIB: f64 = 1024.0 * 1024.0;
-const CPU_PRIME: u32 = 20_000;
+pub const CPU_PRIME: u32 = 20_000;
 pub const MEMORY_TRANSFER_MIB: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

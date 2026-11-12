@@ -1,5 +1,5 @@
 use crate::bench::{Metric, MetricKind};
-use crate::report::{ColorMode, Outcome, clean};
+use crate::report::{ColorMode, Outcome, Section, clean};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use std::io::{IsTerminal, stderr};
 use std::time::{Duration, Instant};
@@ -30,18 +30,31 @@ impl RunProgress {
         self.enabled
     }
 
-    pub fn start(&mut self, name: &str, planned_seconds: Option<u32>) -> Stage {
+    pub fn section(&self, section: Section, context: Option<&str>) {
+        if self.enabled {
+            eprintln!("\n{}", section.heading(self.color));
+            if let Some(context) = context {
+                eprintln!("  {context}");
+            }
+        }
+    }
+
+    pub fn start(&mut self, name: &str, workload: &str, planned_seconds: Option<u32>) -> Stage {
         self.index += 1;
         let label = format!("{}/{}  {name}", self.index, self.total);
         let bar = self.enabled.then(|| {
             let template = if self.color {
-                "{spinner:.cyan} {elapsed_precise:.cyan}  {prefix}\n  {meter:.cyan}{wide_msg}"
+                "{spinner:.cyan} {elapsed_precise:.cyan}  {prefix}\n  {workload}\n  {meter:.cyan}{wide_msg}"
             } else {
-                "{spinner} {elapsed_precise}  {prefix}\n  {meter}{wide_msg}"
+                "{spinner} {elapsed_precise}  {prefix}\n  {workload}\n  {meter}{wide_msg}"
             };
+            let workload = workload.to_owned();
             let style = ProgressStyle::with_template(template)
                 .expect("valid progress template")
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓")
+                .with_key("workload", move |_: &ProgressState, out: &mut dyn std::fmt::Write| {
+                    let _ = out.write_str(&workload);
+                })
                 .with_key(
                     "meter",
                     move |state: &ProgressState, out: &mut dyn std::fmt::Write| {

@@ -7,7 +7,7 @@ case "$(uname -s)/$(uname -m)" in
     *) printf '%s\n' 'Use Linux x86-64 or ARM64, or build from source.' >&2; exit 1 ;;
 esac
 
-release=https://github.com/xDilettante/vps-bench/releases/download/v0.3.0
+release=https://github.com/xDilettante/vps-bench/releases/download/v0.4.0
 archive="vps-bench-$platform.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -f -- "$tmp/$archive" "$tmp/$archive.sha256" "$tmp/vps-bench"; rmdir -- "$tmp"' EXIT

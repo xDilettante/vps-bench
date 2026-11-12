@@ -20,20 +20,22 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and netwo
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.3.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.4.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
 
 ## Демонстрация в WSL
 
-Команда ниже выполняет 40 ICMP-проб по локальному адресу Ubuntu и показывает обновления около восьми секунд. Для демо нужны `curl` и `iputils-ping`.
+Короткий прогон показывает разделы CPU, памяти и диска. В Ubuntu для него нужны `curl`, `sysbench` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.3.0/run.sh | bash -s -- run --only latency --ping-target 127.0.0.1 --ping-count 40'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.4.0/run.sh | bash -s -- run --only cpu,memory,disk --seconds 5 --disk-mib 128'
 ```
 
 В терминале видны текущий этап, шкала времени и промежуточные показатели. Для CPU, RAM и TCP выводятся значения за интервал, для диска — средние с начала этапа, для ICMP — RTT последнего ответа и счётчик ответов. Для промежуточной скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее). При перенаправлении stderr или с `--no-progress` остаётся итоговый отчёт.
+
+Для просмотра только RTT укажите `run --only latency --ping-target 127.0.0.1 --ping-count 40`. Живой экран, итог и сравнение показывают параметры каждого этапа. Диск определяется по каталогу `--disk-dir`. При доступности `findmnt` и `lsblk` выводятся том, файловая система и характеристики блочного устройства, видимые Linux. Флаг `ROTA` относится к устройству в гостевой ОС.
 
 ## Запуск на Linux и сравнение
 

@@ -36,9 +36,17 @@ pub fn run(
 
     for test in [Case::PingIdle, Case::PingUpload, Case::PingDownload] {
         let server = load.filter(|_| test != Case::PingIdle);
+        let mut profile = json!({"count": count, "interval_ms": INTERVAL_MS});
+        if let Some(server) = server {
+            profile["load"] = json!({
+                "host": server.host, "port": server.port,
+                "streams": server.streams, "seconds": load_seconds
+            });
+        }
         let first = measurements.len();
         let stage = progress.start(
             test.label(),
+            &test.workload(&profile),
             Some(if server.is_some() {
                 load_seconds
             } else {
@@ -74,13 +82,7 @@ pub fn run(
             Err(reason) => Err(reason),
         };
         for target in targets {
-            let mut parameters = json!({"count": count, "interval_ms": INTERVAL_MS});
-            if let Some(server) = server {
-                parameters["load"] = json!({
-                    "host": server.host, "port": server.port,
-                    "streams": server.streams, "seconds": load_seconds
-                });
-            }
+            let mut parameters = profile.clone();
             let outcome = match &mut results {
                 Ok(rows) => match rows.next() {
                     Some(Ok(probe)) => {
@@ -98,12 +100,12 @@ pub fn run(
                     reason: reason.clone(),
                 },
             };
-            measurements.push(Measurement {
+            measurements.push(Measurement::new(
                 test,
-                target: Some(target.clone()),
+                Some(target.clone()),
                 parameters,
                 outcome,
-            });
+            ));
         }
         stage.finish(
             measurements[first..]

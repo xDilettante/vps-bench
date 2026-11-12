@@ -1,4 +1,5 @@
-use crate::bench::{Metric, MetricKind};
+use crate::bench::{CPU_PRIME, Metric, MetricKind};
+use crate::disk::BlockDevice;
 use crate::host::Host;
 use comfy_table::{Cell, Color, ContentArrangement, Table, modifiers, presets};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,40 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 
 const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Section {
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+    Latency,
+}
+
+impl Section {
+    pub const ORDER: [Self; 5] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Latency,
+        Self::Network,
+    ];
+
+    pub fn heading(self, color: bool) -> String {
+        let title = match self {
+            Self::Cpu => "CPU · Процессор",
+            Self::Memory => "RAM · Оперативная память",
+            Self::Disk => "Диск · Накопитель",
+            Self::Network => "Сеть · Пропускная способность TCP",
+            Self::Latency => "Сеть · Задержка и потери ICMP",
+        };
+        if color {
+            format!("\x1b[1;36m{title}\x1b[0m")
+        } else {
+            title.to_owned()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,36 +86,135 @@ impl Case {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::CpuSingle => "CPU · один поток",
-            Self::CpuMulti => "CPU · многопоточный",
-            Self::RamRead => "RAM · чтение",
-            Self::RamWrite => "RAM · запись",
-            Self::DiskSeqWrite => "Диск · запись 1 МиБ",
-            Self::DiskSeqRead => "Диск · чтение 1 МиБ",
-            Self::DiskRandRead => "Диск · случайное чтение 4 КиБ",
-            Self::DiskRandWrite => "Диск · случайная запись 4 КиБ",
-            Self::DiskSync => "Диск · запись с fdatasync",
-            Self::NetUp => "TCP ↑ один поток",
-            Self::NetDown => "TCP ↓ один поток",
-            Self::NetUpMulti => "TCP ↑ несколько потоков",
-            Self::NetDownMulti => "TCP ↓ несколько потоков",
-            Self::PingIdle => "ICMP · простой",
-            Self::PingUpload => "ICMP · нагрузка ↑",
-            Self::PingDownload => "ICMP · нагрузка ↓",
+            Self::CpuSingle => "Однопоточная производительность",
+            Self::CpuMulti => "Многопоточная производительность",
+            Self::RamRead | Self::DiskSeqRead => "Последовательное чтение",
+            Self::RamWrite | Self::DiskSeqWrite => "Последовательная запись",
+            Self::DiskRandRead => "Случайное чтение",
+            Self::DiskRandWrite => "Случайная запись",
+            Self::DiskSync => "Случайная запись с fdatasync",
+            Self::NetUp => "Отправка с VPS · один поток",
+            Self::NetDown => "Приём на VPS · один поток",
+            Self::NetUpMulti => "Отправка с VPS · несколько потоков",
+            Self::NetDownMulti => "Приём на VPS · несколько потоков",
+            Self::PingIdle => "В простое",
+            Self::PingUpload => "При отправке TCP",
+            Self::PingDownload => "При приёме TCP",
         }
     }
 
-    pub fn tool(self) -> &'static str {
+    pub fn section(self) -> Section {
         match self {
-            Self::CpuSingle | Self::CpuMulti | Self::RamRead | Self::RamWrite => "sysbench",
+            Self::CpuSingle | Self::CpuMulti => Section::Cpu,
+            Self::RamRead | Self::RamWrite => Section::Memory,
             Self::DiskSeqWrite
             | Self::DiskSeqRead
             | Self::DiskRandRead
             | Self::DiskRandWrite
-            | Self::DiskSync => "fio",
-            Self::PingIdle | Self::PingUpload | Self::PingDownload => "ping",
-            _ => "iperf3",
+            | Self::DiskSync => Section::Disk,
+            Self::NetUp | Self::NetDown | Self::NetUpMulti | Self::NetDownMulti => Section::Network,
+            Self::PingIdle | Self::PingUpload | Self::PingDownload => Section::Latency,
         }
+    }
+
+    pub fn workload(self, parameters: &Value) -> String {
+        let amount = |key| {
+            parameters[key]
+                .as_u64()
+                .map_or("—".to_owned(), |n| n.to_string())
+        };
+        let seconds = amount("seconds");
+        match self.section() {
+            Section::Cpu => format!(
+                "sysbench cpu · простые числа до {CPU_PRIME} · {} · {seconds} с",
+                threads(&parameters["threads"])
+            ),
+            Section::Memory => format!(
+                "sysbench memory · буфер {} МиБ · {} · до {seconds} с",
+                amount("block_mib"),
+                threads(&parameters["threads"])
+            ),
+            Section::Disk => {
+                let block = match parameters["block_kib"].as_u64() {
+                    Some(1024) => "1 МиБ".to_owned(),
+                    Some(kib) => format!("{kib} КиБ"),
+                    None => "—".to_owned(),
+                };
+                let io = match parameters["direct"].as_bool() {
+                    Some(true) => "прямой I/O",
+                    Some(false) => "буферизованный I/O",
+                    None => "режим I/O неизвестен",
+                };
+                let limit = match self {
+                    Self::DiskSeqWrite => "один проход · fsync в конце".to_owned(),
+                    Self::DiskSync => format!("до {seconds} с · fdatasync после блока"),
+                    Self::DiskSeqRead | Self::DiskRandRead => format!("{seconds} с · циклически"),
+                    _ => format!("до {seconds} с"),
+                };
+                format!(
+                    "fio · блок {block} · очередь {} · {io} · файл {} МиБ · {limit}",
+                    amount("iodepth"),
+                    amount("size_mib")
+                )
+            }
+            Section::Network => match endpoint(parameters) {
+                Some(server) => format!(
+                    "iperf3 · {server} · {} · {seconds} с",
+                    threads(&parameters["streams"])
+                ),
+                None => "iperf3 · укажите сервер через --iperf-host".to_owned(),
+            },
+            Section::Latency => {
+                let mut workload = format!(
+                    "ping · {} проб на узел · интервал {} мс",
+                    amount("count"),
+                    amount("interval_ms")
+                );
+                if let Some(address) = parameters["resolved_address"].as_str() {
+                    workload.push_str(&format!(" · IP {}", clean(address)));
+                }
+                if let Some(server) = endpoint(&parameters["load"]) {
+                    workload.push_str(&format!(
+                        " · нагрузка iperf3 {server} · {} · {} с",
+                        threads(&parameters["load"]["streams"]),
+                        parameters["load"]["seconds"]
+                    ));
+                }
+                workload
+            }
+        }
+    }
+
+    pub fn tool(self) -> &'static str {
+        match self.section() {
+            Section::Cpu | Section::Memory => "sysbench",
+            Section::Disk => "fio",
+            Section::Latency => "ping",
+            Section::Network => "iperf3",
+        }
+    }
+}
+
+fn threads(value: &Value) -> String {
+    let Some(count) = value.as_u64() else {
+        return "число потоков неизвестно".into();
+    };
+    let unit = match (count % 100, count % 10) {
+        (11..=14, _) => "потоков",
+        (_, 1) => "поток",
+        (_, 2..=4) => "потока",
+        _ => "потоков",
+    };
+    format!("{count} {unit}")
+}
+
+fn endpoint(parameters: &Value) -> Option<String> {
+    let host = clean(parameters["host"].as_str()?);
+    let port = parameters["port"].as_u64()?;
+    if host.contains(':') {
+        Some(format!("[{host}]:{port}"))
+    } else {
+        Some(format!("{host}:{port}"))
     }
 }
 
@@ -90,8 +224,28 @@ pub struct Measurement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub parameters: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<String>,
     #[serde(flatten)]
     pub outcome: Outcome,
+}
+
+impl Measurement {
+    pub fn new(test: Case, target: Option<String>, parameters: Value, outcome: Outcome) -> Self {
+        Self {
+            test,
+            target,
+            workload: Some(test.workload(&parameters)),
+            parameters,
+            outcome,
+        }
+    }
+
+    fn workload(&self) -> String {
+        self.workload
+            .as_deref()
+            .map_or_else(|| self.test.workload(&self.parameters), clean)
+    }
 }
 
 fn test_label(test: Case, target: Option<&str>) -> String {
@@ -151,6 +305,8 @@ pub struct Report {
     pub tools: BTreeMap<String, String>,
     pub disk_directory: Option<String>,
     pub disk_filesystem: Option<String>,
+    pub disk_source: Option<String>,
+    pub disk_device: Option<BlockDevice>,
     pub disk_available_mib: Option<u64>,
     pub measurements: Vec<Measurement>,
 }
@@ -165,6 +321,8 @@ impl Report {
             tools: BTreeMap::new(),
             disk_directory: None,
             disk_filesystem: None,
+            disk_source: None,
+            disk_device: None,
             disk_available_mib: None,
             measurements: Vec::new(),
         }
@@ -205,48 +363,142 @@ impl Report {
                 .any(|row| matches!(row.outcome, Outcome::Failed { .. }))
     }
 
-    pub fn print(&self, color: ColorMode) {
-        println!("VPS Bench · {}", host_summary(&self.host));
-        if let Some(path) = &self.disk_directory {
-            let filesystem = clean(self.disk_filesystem.as_deref().unwrap_or("ФС неизвестна"));
-            let available = self.disk_available_mib.map_or(String::new(), |mib| {
-                format!(" · свободно {:.2} ГиБ", mib as f64 / 1024.0)
-            });
-            println!("Том для fio · {} ({filesystem}){available}", clean(path));
+    pub fn section_context(&self, section: Section) -> Option<String> {
+        match section {
+            Section::Cpu => Some(format!(
+                "{} · доступно {} vCPU",
+                clean(self.host.cpu_model.as_deref().unwrap_or(&self.host.arch)),
+                self.host.available_vcpus
+            )),
+            Section::Memory => {
+                let mut details = Vec::new();
+                if let Some(mib) = self.host.ram_mib {
+                    details.push(format!("всего {:.2} ГиБ", mib as f64 / 1024.0));
+                }
+                if let Some(mib) = self.host.available_ram_mib {
+                    details.push(format!("доступно {:.2} ГиБ", mib as f64 / 1024.0));
+                }
+                if let Some(mib) = self.host.used_swap_mib {
+                    details.push(format!("занято swap {mib} МиБ"));
+                }
+                (!details.is_empty()).then(|| details.join(" · "))
+            }
+            Section::Disk => self.disk_context(),
+            Section::Network | Section::Latency => None,
         }
-        let mut table = table(color, &["Тест", "Метрика", "Результат", "Статус"]);
-        for row in &self.measurements {
-            let label = test_label(row.test, row.target.as_deref());
-            if row.outcome.metrics().is_empty() {
-                table.add_row([
-                    Cell::new(&label),
-                    Cell::new(""),
-                    Cell::new(clean(row.outcome.reason())),
-                    status_cell(Some(row)),
-                ]);
+    }
+
+    fn disk_context(&self) -> Option<String> {
+        let directory = self.disk_directory.as_deref()?;
+        let mut mount = Vec::new();
+        if let Some(source) = &self.disk_source {
+            mount.push(format!("том {}", clean(source)));
+        }
+        if let Some(filesystem) = &self.disk_filesystem {
+            mount.push(format!("ФС {}", clean(filesystem)));
+        }
+        if let Some(mib) = self.disk_available_mib {
+            mount.push(format!("свободно {:.2} ГиБ", mib as f64 / 1024.0));
+        }
+        mount.push(format!("каталог {}", clean(directory)));
+        let mut context = mount.join(" · ");
+        if let Some(device) = &self.disk_device {
+            let mut details = Vec::new();
+            if let Some(model) = &device.model {
+                details.push(clean(model));
+            }
+            if let Some(transport) = &device.transport {
+                details.push(clean(transport));
+            }
+            if let Some(size) = device.size_bytes {
+                details.push(format!("объём {:.1} ГиБ", size as f64 / 1024_f64.powi(3)));
+            }
+            if let Some(rotational) = device.rotational {
+                let kind = if rotational {
+                    "вращающийся"
+                } else {
+                    "без вращения"
+                };
+                details.push(format!(
+                    "{kind} по данным гостя (ROTA={})",
+                    u8::from(rotational)
+                ));
+            }
+            if !details.is_empty() {
+                context.push_str("\n  ");
+                context.push_str(&details.join(" · "));
+            }
+        }
+        Some(context)
+    }
+
+    pub fn print(&self, color: ColorMode) {
+        println!(
+            "VPS Bench · {} · {}",
+            clean(&self.host.label),
+            clean(&self.host.arch)
+        );
+        for section in Section::ORDER {
+            let mut rows = self
+                .measurements
+                .iter()
+                .filter(|row| row.test.section() == section)
+                .peekable();
+            if rows.peek().is_none() {
                 continue;
             }
-            for (index, metric) in row.outcome.metrics().iter().enumerate() {
-                let (label, status) = if index == 0 {
-                    (label.as_str(), status_cell(Some(row)))
-                } else {
-                    ("", Cell::new(""))
-                };
-                table.add_row([
-                    Cell::new(label),
-                    Cell::new(metric.kind.label()),
-                    metric_cell(metric.kind, metric.value),
-                    status,
-                ]);
+            println!(
+                "\n{}",
+                section.heading(color.enabled(stdout().is_terminal()))
+            );
+            if let Some(context) = self.section_context(section) {
+                println!("  {context}");
             }
+            let mut table = table(
+                color,
+                &["Замер и параметры", "Показатель", "Значение", "Статус"],
+            );
+            for row in rows {
+                add_measurement(&mut table, row);
+            }
+            println!("{table}");
         }
-        println!("{table}");
     }
 
     fn measurement(&self, test: Case, target: Option<&str>) -> Option<&Measurement> {
         self.measurements
             .iter()
             .find(|row| row.test == test && row.target.as_deref() == target)
+    }
+}
+
+fn add_measurement(table: &mut Table, row: &Measurement) {
+    let label = format!(
+        "{}\n{}",
+        test_label(row.test, row.target.as_deref()),
+        row.workload()
+    );
+    if row.outcome.metrics().is_empty() {
+        table.add_row([
+            Cell::new(&label),
+            Cell::new(""),
+            Cell::new(clean(row.outcome.reason())),
+            status_cell(Some(row)),
+        ]);
+        return;
+    }
+    for (index, metric) in row.outcome.metrics().iter().enumerate() {
+        let (label, status) = if index == 0 {
+            (label.as_str(), status_cell(Some(row)))
+        } else {
+            ("", Cell::new(""))
+        };
+        table.add_row([
+            Cell::new(label),
+            Cell::new(metric.kind.label()),
+            metric_cell(metric.kind, metric.value),
+            status,
+        ]);
     }
 }
 
@@ -273,9 +525,11 @@ impl ColorMode {
 
 fn table(color: ColorMode, headers: &[&str]) -> Table {
     let mut table = Table::new();
+    let width = table.width().filter(|width| *width > 0).unwrap_or(96);
     table
         .load_preset(presets::UTF8_FULL_CONDENSED)
         .apply_modifier(modifiers::UTF8_ROUND_CORNERS)
+        .set_width(width)
         .set_content_arrangement(ContentArrangement::Dynamic);
     if color.enabled(stdout().is_terminal()) {
         table.enforce_styling();
@@ -360,84 +614,110 @@ pub fn compare(left: &Report, right: &Report, color: ColorMode) {
             );
         }
     }
-    let mut table = table(color, &["Тест", "Метрика", "A", "B", "B к A"]);
     let tests: BTreeSet<_> = left
         .measurements
         .iter()
         .chain(&right.measurements)
         .map(|row| (row.test, row.target.as_deref()))
         .collect();
-    for (test, target) in tests {
-        let (a, b) = (
-            left.measurement(test, target),
-            right.measurement(test, target),
-        );
-        let metrics_a = a.map_or(&[][..], |row| row.outcome.metrics());
-        let metrics_b = b.map_or(&[][..], |row| row.outcome.metrics());
-        if metrics_a.is_empty() && metrics_b.is_empty() {
-            if a.is_some() || b.is_some() {
-                table.add_row([
-                    Cell::new(test_label(test, target)),
-                    Cell::new(""),
-                    status_cell(a),
-                    status_cell(b),
-                    Cell::new("—"),
-                ]);
-            }
+    for section in Section::ORDER {
+        let mut section_tests = tests
+            .iter()
+            .filter(|(test, _)| test.section() == section)
+            .peekable();
+        if section_tests.peek().is_none() {
             continue;
         }
-        let mut kinds: Vec<_> = metrics_a.iter().map(|metric| metric.kind).collect();
-        for metric in metrics_b {
-            if !kinds.contains(&metric.kind) {
-                kinds.push(metric.kind);
+        println!(
+            "\n{}",
+            section.heading(color.enabled(stdout().is_terminal()))
+        );
+        if section == Section::Disk {
+            for (name, report) in [("A", left), ("B", right)] {
+                if let Some(context) = report.disk_context() {
+                    println!("  {name} · {context}");
+                }
             }
         }
-        let mismatch = a
-            .zip(b)
-            .is_some_and(|(a, b)| !comparable_parameters(test, &a.parameters, &b.parameters));
-        let label = match a.zip(b) {
-            Some((a, b))
-                if test == Case::CpuMulti && a.parameters["threads"] != b.parameters["threads"] =>
-            {
-                format!(
-                    "{} ({} → {} потоков)",
-                    test.label(),
-                    a.parameters["threads"],
-                    b.parameters["threads"]
-                )
-            }
-            _ => test_label(test, target),
-        };
-        for (index, kind) in kinds.into_iter().enumerate() {
-            let get = |metrics: &[Metric]| {
-                metrics
-                    .iter()
-                    .find(|metric| metric.kind == kind)
-                    .map(|metric| metric.value)
-            };
-            let (value_a, value_b) = (get(metrics_a), get(metrics_b));
-            let display = |value: Option<f64>, row: Option<&Measurement>| match value {
-                Some(value) => metric_cell(kind, value),
-                None if row.is_some_and(|row: &Measurement| !row.outcome.metrics().is_empty()) => {
-                    Cell::new("—")
-                }
-                None => status_cell(row),
-            };
-            let change = match value_a.zip(value_b) {
-                Some(_) if mismatch => Cell::new("Разные параметры").fg(Color::Yellow),
-                Some((a, b)) => delta(kind, a, b),
-                None => Cell::new("—"),
-            };
-            table.add_row([
-                Cell::new(if index == 0 { &label } else { "" }),
-                Cell::new(kind.label()),
-                display(value_a, a),
-                display(value_b, b),
-                change,
-            ]);
+        let mut table = table(
+            color,
+            &["Замер и параметры", "Показатель", "A", "B", "B к A"],
+        );
+        for &(test, target) in section_tests {
+            add_comparison(
+                &mut table,
+                test,
+                target,
+                left.measurement(test, target),
+                right.measurement(test, target),
+            );
+        }
+        println!("{table}");
+    }
+}
+
+fn add_comparison(
+    table: &mut Table,
+    test: Case,
+    target: Option<&str>,
+    a: Option<&Measurement>,
+    b: Option<&Measurement>,
+) {
+    let label = test_label(test, target);
+    let workload_a = a.map(Measurement::workload);
+    let workload_b = b.map(Measurement::workload);
+    let label = match (workload_a, workload_b) {
+        (Some(a), Some(b)) if a != b => format!("{label}\nA · {a}\nB · {b}"),
+        (Some(workload), _) | (_, Some(workload)) => format!("{label}\n{workload}"),
+        _ => label,
+    };
+    let metrics_a = a.map_or(&[][..], |row| row.outcome.metrics());
+    let metrics_b = b.map_or(&[][..], |row| row.outcome.metrics());
+    if metrics_a.is_empty() && metrics_b.is_empty() {
+        table.add_row([
+            Cell::new(label),
+            Cell::new(""),
+            status_cell(a),
+            status_cell(b),
+            Cell::new("—"),
+        ]);
+        return;
+    }
+    let mut kinds: Vec<_> = metrics_a.iter().map(|metric| metric.kind).collect();
+    for metric in metrics_b {
+        if !kinds.contains(&metric.kind) {
+            kinds.push(metric.kind);
         }
     }
-    println!("{table}");
+    let mismatch = a
+        .zip(b)
+        .is_some_and(|(a, b)| !comparable_parameters(test, &a.parameters, &b.parameters));
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let get = |metrics: &[Metric]| {
+            metrics
+                .iter()
+                .find(|metric| metric.kind == kind)
+                .map(|metric| metric.value)
+        };
+        let (value_a, value_b) = (get(metrics_a), get(metrics_b));
+        let display = |value: Option<f64>, row: Option<&Measurement>| match value {
+            Some(value) => metric_cell(kind, value),
+            None if row.is_some_and(|row| !row.outcome.metrics().is_empty()) => Cell::new("—"),
+            None => status_cell(row),
+        };
+        let change = match value_a.zip(value_b) {
+            Some(_) if mismatch => Cell::new("Разные параметры").fg(Color::Yellow),
+            Some((a, b)) => delta(kind, a, b),
+            None => Cell::new("—"),
+        };
+        table.add_row([
+            Cell::new(if index == 0 { &label } else { "" }),
+            Cell::new(kind.label()),
+            display(value_a, a),
+            display(value_b, b),
+            change,
+        ]);
+    }
 }
 
 fn delta(kind: MetricKind, before: f64, after: f64) -> Cell {
