@@ -58,6 +58,9 @@ struct RunArgs {
     /// Путь к новому JSON-файлу.
     #[arg(long, short)]
     output: Option<PathBuf>,
+    /// JSON с эталонными замерами для цветной шкалы.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
     /// Скрыть анимацию и промежуточные значения.
     #[arg(long)]
     no_progress: bool,
@@ -162,6 +165,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         .retain(|target| seen.insert(target.clone()));
     let latency = !args.ping_targets.is_empty()
         && (args.only.contains(&Section::Latency) || args.only.contains(&Section::Network));
+    let baseline = args.baseline.as_deref().map(Report::load).transpose()?;
 
     let started_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -369,7 +373,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
     report
         .save(output, &path)
         .map_err(|err| format!("{}: {err}", path.display()))?;
-    report.print(color);
+    report.print(color, baseline.as_ref());
     println!("JSON · {}", clean(&path.display().to_string()));
     Ok(report.success())
 }

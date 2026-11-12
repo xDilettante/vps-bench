@@ -432,12 +432,17 @@ impl Report {
         Some(context)
     }
 
-    pub fn print(&self, color: ColorMode) {
+    pub fn print(&self, color: ColorMode, baseline: Option<&Report>) {
         println!(
             "VPS Bench · {} · {}",
             clean(&self.host.label),
             clean(&self.host.arch)
         );
+        if let Some(baseline) = baseline {
+            println!("Эталон · {}", host_summary(&baseline.host));
+            print_tool_changes(baseline, self);
+            print_scale_legend();
+        }
         for section in Section::ORDER {
             let mut rows = self
                 .measurements
@@ -454,12 +459,13 @@ impl Report {
             if let Some(context) = self.section_context(section) {
                 println!("  {context}");
             }
-            let mut table = table(
-                color,
-                &["Замер и параметры", "Показатель", "Значение", "Статус"],
-            );
+            let mut headers = vec!["Замер и параметры", "Показатель", "Значение", "Статус"];
+            if baseline.is_some() {
+                headers.push("К эталону");
+            }
+            let mut table = table(color, &headers);
             for row in rows {
-                add_measurement(&mut table, row);
+                add_measurement(&mut table, row, baseline);
             }
             println!("{table}");
         }
@@ -472,33 +478,49 @@ impl Report {
     }
 }
 
-fn add_measurement(table: &mut Table, row: &Measurement) {
+fn add_measurement(table: &mut Table, row: &Measurement, baseline: Option<&Report>) {
     let label = format!(
         "{}\n{}",
         test_label(row.test, row.target.as_deref()),
         row.workload()
     );
     if row.outcome.metrics().is_empty() {
-        table.add_row([
+        let mut cells = vec![
             Cell::new(&label),
             Cell::new(""),
             Cell::new(clean(row.outcome.reason())),
             status_cell(Some(row)),
-        ]);
+        ];
+        if baseline.is_some() {
+            cells.push(Cell::new("—"));
+        }
+        table.add_row(cells);
         return;
     }
+    let reference = baseline.and_then(|report| report.measurement(row.test, row.target.as_deref()));
+    let mismatch = reference
+        .is_some_and(|base| !comparable_parameters(row.test, &base.parameters, &row.parameters));
     for (index, metric) in row.outcome.metrics().iter().enumerate() {
         let (label, status) = if index == 0 {
             (label.as_str(), status_cell(Some(row)))
         } else {
             ("", Cell::new(""))
         };
-        table.add_row([
+        let mut cells = vec![
             Cell::new(label),
             Cell::new(metric.kind.label()),
             metric_cell(metric.kind, metric.value),
             status,
-        ]);
+        ];
+        if baseline.is_some() {
+            cells.push(comparison_cell(
+                metric.kind,
+                reference.and_then(|base| metric_value(base.outcome.metrics(), metric.kind)),
+                Some(metric.value),
+                mismatch,
+            ));
+        }
+        table.add_row(cells);
     }
 }
 
@@ -603,17 +625,8 @@ pub fn comparable_parameters(test: Case, left: &Value, right: &Value) -> bool {
 pub fn compare(left: &Report, right: &Report, color: ColorMode) {
     println!("A · {}", host_summary(&left.host));
     println!("B · {}", host_summary(&right.host));
-    for (tool, version_a) in &left.tools {
-        if let Some(version_b) = right.tools.get(tool)
-            && version_a != version_b
-        {
-            println!(
-                "Разные версии {tool} · A {} · B {}",
-                clean(version_a),
-                clean(version_b)
-            );
-        }
-    }
+    print_tool_changes(left, right);
+    print_scale_legend();
     let tests: BTreeSet<_> = left
         .measurements
         .iter()
@@ -656,6 +669,24 @@ pub fn compare(left: &Report, right: &Report, color: ColorMode) {
     }
 }
 
+fn print_scale_legend() {
+    println!("Шкала · ← хуже · │ уровень эталона · лучше →");
+}
+
+fn print_tool_changes(left: &Report, right: &Report) {
+    for (tool, version_a) in &left.tools {
+        if let Some(version_b) = right.tools.get(tool)
+            && version_a != version_b
+        {
+            println!(
+                "Разные версии {tool} · A {} · B {}",
+                clean(version_a),
+                clean(version_b)
+            );
+        }
+    }
+}
+
 fn add_comparison(
     table: &mut Table,
     test: Case,
@@ -693,54 +724,113 @@ fn add_comparison(
         .zip(b)
         .is_some_and(|(a, b)| !comparable_parameters(test, &a.parameters, &b.parameters));
     for (index, kind) in kinds.into_iter().enumerate() {
-        let get = |metrics: &[Metric]| {
-            metrics
-                .iter()
-                .find(|metric| metric.kind == kind)
-                .map(|metric| metric.value)
-        };
-        let (value_a, value_b) = (get(metrics_a), get(metrics_b));
+        let value_a = metric_value(metrics_a, kind);
+        let value_b = metric_value(metrics_b, kind);
         let display = |value: Option<f64>, row: Option<&Measurement>| match value {
             Some(value) => metric_cell(kind, value),
             None if row.is_some_and(|row| !row.outcome.metrics().is_empty()) => Cell::new("—"),
             None => status_cell(row),
-        };
-        let change = match value_a.zip(value_b) {
-            Some(_) if mismatch => Cell::new("Разные параметры").fg(Color::Yellow),
-            Some((a, b)) => delta(kind, a, b),
-            None => Cell::new("—"),
         };
         table.add_row([
             Cell::new(if index == 0 { &label } else { "" }),
             Cell::new(kind.label()),
             display(value_a, a),
             display(value_b, b),
-            change,
+            comparison_cell(kind, value_a, value_b, mismatch),
         ]);
     }
 }
 
-fn delta(kind: MetricKind, before: f64, after: f64) -> Cell {
+fn metric_value(metrics: &[Metric], kind: MetricKind) -> Option<f64> {
+    metrics
+        .iter()
+        .find(|metric| metric.kind == kind)
+        .map(|metric| metric.value)
+}
+
+fn comparison_cell(
+    kind: MetricKind,
+    before: Option<f64>,
+    after: Option<f64>,
+    mismatch: bool,
+) -> Cell {
+    match before.zip(after) {
+        Some(_) if mismatch => Cell::new("Разные параметры").fg(Color::Yellow),
+        Some((before, after)) => assessment(kind, before, after),
+        None => Cell::new("—"),
+    }
+}
+
+pub fn assessment(kind: MetricKind, before: f64, after: f64) -> Cell {
     if matches!(kind, MetricKind::PacketsSent | MetricKind::PacketsReceived) {
         return Cell::new("—");
     }
     let diff = after - before;
-    if diff == 0.0 {
-        return Cell::new("0");
+    if !diff.is_finite() {
+        return Cell::new("—");
     }
     let percentage_points = matches!(
         kind,
         MetricKind::CpuStealPercent | MetricKind::PacketLossPercent
     );
-    let text = if before > 0.0 && !percentage_points {
-        format!("{:+.2}%", 100.0 * diff / before)
+    let relative = (before > 0.0)
+        .then(|| diff / before * 100.0)
+        .filter(|n| n.is_finite());
+    let (magnitude, span, margin, text) = if percentage_points {
+        let sign = if diff > 0.0 { "+" } else { "" };
+        (
+            diff.abs(),
+            Some(5.0),
+            0.1,
+            format!("{sign}{} п.п.", format_value(diff)),
+        )
+    } else if let Some(relative) = relative {
+        (relative.abs(), Some(50.0), 5.0, format!("{relative:+.2}%"))
     } else {
         let sign = if diff > 0.0 { "+" } else { "" };
-        let unit = if percentage_points { " п.п." } else { "" };
-        format!("{sign}{}{unit}", format_value(diff))
+        (
+            diff.abs(),
+            None,
+            0.0,
+            format!("{sign}{}", format_value(diff)),
+        )
     };
     let better = (diff > 0.0) == kind.higher_is_better();
-    Cell::new(text).fg(if better { Color::Green } else { Color::Red })
+    let close = magnitude <= margin;
+    let (status, color) = if close {
+        ("Близко", Color::Cyan)
+    } else if better {
+        ("Лучше", Color::Green)
+    } else {
+        ("Хуже", Color::Red)
+    };
+    let Some(span) = span else {
+        let direction = if close {
+            "│"
+        } else if better {
+            "→"
+        } else {
+            "←"
+        };
+        return Cell::new(format!("{direction} {status} {text}")).fg(color);
+    };
+    const SLOTS: usize = 5;
+    let fill = if close {
+        0
+    } else {
+        (magnitude / span * SLOTS as f64)
+            .round()
+            .clamp(1.0, SLOTS as f64) as usize
+    };
+    let (left, right) = if better { (0, fill) } else { (fill, 0) };
+    let bar = format!(
+        "{}{}│{}{}",
+        "─".repeat(SLOTS - left),
+        "█".repeat(left),
+        "█".repeat(right),
+        "─".repeat(SLOTS - right),
+    );
+    Cell::new(format!("{bar}\n{status} {text}")).fg(color)
 }
 
 fn metric_cell(kind: MetricKind, value: f64) -> Cell {

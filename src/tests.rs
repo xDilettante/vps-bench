@@ -179,3 +179,40 @@ fn disk_device_metadata_matches_the_measured_mount_by_device_number() {
     assert_eq!(value["rotational"], false);
     assert!(BlockDevice::find(&devices, "0:83").is_none());
 }
+
+#[test]
+fn assessment_points_toward_improvement_for_rates_and_delays() {
+    use super::bench::MetricKind;
+    use super::report::assessment;
+
+    let faster = assessment(MetricKind::MibPerSecond, 100.0, 120.0).content();
+    let lower_rtt = assessment(MetricKind::RttP95Ms, 20.0, 10.0).content();
+    let slower = assessment(MetricKind::Iops, 100.0, 80.0).content();
+    assert_eq!(faster, "─────│██───\nЛучше +20.00%");
+    assert_eq!(lower_rtt, "─────│█████\nЛучше -50.00%");
+    assert_eq!(slower, "───██│─────\nХуже -20.00%");
+}
+
+#[test]
+fn assessment_handles_noise_band_and_zero_baselines() {
+    use super::bench::MetricKind;
+    use super::report::assessment;
+
+    assert_eq!(
+        assessment(MetricKind::EventsPerSecond, 100.0, 103.0).content(),
+        "─────│─────\nБлизко +3.00%"
+    );
+    assert_eq!(
+        assessment(MetricKind::PacketLossPercent, 0.0, 1.0).content(),
+        "────█│─────\nХуже +1.000 п.п."
+    );
+    assert!(
+        assessment(MetricKind::TcpRetransmits, 0.0, 2.0)
+            .content()
+            .contains("Хуже +2.000")
+    );
+    assert_eq!(
+        assessment(MetricKind::PacketsSent, 100.0, 120.0).content(),
+        "—"
+    );
+}
