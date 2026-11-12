@@ -3,6 +3,7 @@ mod disk;
 mod host;
 mod latency;
 mod progress;
+mod quality;
 mod report;
 
 #[cfg(test)]

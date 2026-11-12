@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/xDilettante/vps-bench)](https://github.com/xDilettante/vps-bench/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Displays live measurements in the terminal and saves a local JSON report.
+Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Displays live measurements, rates the results against built-in targets and saves a local JSON report.
 
 | Раздел | Метрики |
 |---|---|
@@ -20,7 +20,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and netwo
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.5.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.6.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
@@ -30,12 +30,35 @@ ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.gith
 Короткий прогон показывает разделы CPU, памяти и диска. В Ubuntu для него нужны `curl`, `sysbench` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.5.0/run.sh | bash -s -- run --only cpu,memory,disk --seconds 5 --disk-mib 128'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.6.0/run.sh | bash -s -- run --only cpu,memory,disk --seconds 5 --disk-mib 128'
 ```
 
 В терминале видны текущий этап, шкала времени и промежуточные показатели. Для CPU, RAM и TCP выводятся значения за интервал, для диска — средние с начала этапа, для ICMP — RTT последнего ответа и счётчик ответов. Для промежуточной скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее). При перенаправлении stderr или с `--no-progress` остаётся итоговый отчёт.
 
 Для просмотра только RTT укажите `run --only latency --ping-target 127.0.0.1 --ping-count 40`. Живой экран, итог и сравнение показывают параметры каждого этапа. Диск определяется по каталогу `--disk-dir`. При доступности `findmnt` и `lsblk` выводятся том, файловая система и характеристики блочного устройства, видимые Linux. Флаг `ROTA` относится к устройству в гостевой ОС.
+
+## Оценки первого запуска
+
+При первом запуске `run` красная полоса означает «Плохо», жёлтая — «Норма», зелёная — «Хорошо». Под полосой указаны пороги для «Нормы» и «Хорошо» в единицах показателя. Более высокая скорость и более низкая задержка заполняют полосу вправо. Полная полоса соответствует уровню «Хорошо».
+
+| Показатель | Норма | Хорошо |
+|---|---:|---:|
+| CPU sysbench, событий/с на поток | ≥ 500 | ≥ 1 200 |
+| CPU steal | ≤ 5% | ≤ 1% |
+| Чтение RAM, МиБ/с | ≥ 5 120 | ≥ 12 288 |
+| Запись RAM, МиБ/с | ≥ 4 096 | ≥ 10 240 |
+| Диск, последовательный I/O, МиБ/с | ≥ 125 | ≥ 500 |
+| Диск, случайный I/O 4 КиБ, IOPS | ≥ 1 000 | ≥ 5 000 |
+| Задержка случайного I/O p50 / p95 / p99, мс | ≤ 2 / 5 / 10 | ≤ 0,5 / 1 / 2 |
+| Запись 4 КиБ с `fdatasync`, IOPS | ≥ 100 | ≥ 1 000 |
+| Задержка `fdatasync` p95 / p99, мс | ≤ 10 / 20 | ≤ 2 / 5 |
+| Скорость TCP, Мбит/с | ≥ 90 | ≥ 900 |
+| RTT до узла, мс | ≤ 100 | ≤ 30 |
+| Потери ICMP | ≤ 1% | 0% |
+
+Для многопоточного CPU границы умножаются на число потоков. Для RAM границы относятся к однопоточному тесту с буфером 64 МиБ. При другом буфере выводится измеренная скорость. Сетевые оценки относятся к маршруту до указанного узла в измеряемой фазе. Потери ICMP зависят от числа проб, при 100 запросах один пропуск даёт 1%.
+
+Границы задаёт VPS Bench для быстрой оценки VPS общего назначения. При выборе масштаба CPU использованы опубликованные замеры sysbench с пределом 20 000. Порог последовательного I/O 125 МиБ/с соответствует базовой пропускной способности gp3 в условиях AWS. [Замеры CPU](https://lpc.events/event/18/contributions/1863/attachments/1634/3408/06-Nested%20CVM%20Performance.pdf), [спецификация EBS gp3](https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html)
 
 ## Запуск на Linux и сравнение
 
@@ -54,7 +77,7 @@ tar -xzf vps-bench-linux-x86_64.tar.gz
 
 В цветной шкале центр соответствует эталону, левая сторона показывает ухудшение, правая — улучшение. Рост скорости и снижение задержки заполняют правую сторону. Рядом выводится точная разница и текстовая оценка. «Близко» означает изменение в пределах 5% для относительных величин или 0,1 процентного пункта для потерь и CPU steal. Полная сторона шкалы соответствует 50% или 5 процентным пунктам. При нулевом эталоне для остальных метрик видны направление и абсолютная разница.
 
-Чтобы получить такую шкалу сразу в итогах прогона, сохраните эталонный JSON и передайте его через `--baseline`.
+Чтобы увидеть разницу с эталоном сразу в итогах прогона, сохраните эталонный JSON и передайте его через `--baseline`.
 
 ```bash
 ./vps-bench run --only cpu,memory,disk --seconds 5 --disk-mib 128 -o reference.json

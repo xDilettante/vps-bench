@@ -34,4 +34,5 @@ jobs:
           TERM=xterm-256color script -qefc 'stty cols 100 && target/debug/vps-bench run --only latency --ping-target 127.0.0.1 --ping-count 6 --iperf-host 127.0.0.1 --iperf-port 35201 --output /tmp/vps-bench.json' /tmp/vps-bench-terminal.log
           grep -Eq 'ответов [1-6]/6' /tmp/vps-bench-terminal.log
           grep -qF 'Сеть · Задержка и потери ICMP' /tmp/vps-bench-terminal.log
+          grep -qF '≤100 / ≤30' /tmp/vps-bench-terminal.log
           jq -e '.measurements | length == 3 and all(.[]; .status == "completed" and (.workload | startswith("ping")) and any(.metrics[]; .kind == "rtt_p99_ms"))' /tmp/vps-bench.json

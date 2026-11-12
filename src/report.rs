@@ -1,6 +1,7 @@
 use crate::bench::{CPU_PRIME, Metric, MetricKind};
 use crate::disk::BlockDevice;
 use crate::host::Host;
+use crate::quality::rating_cell;
 use comfy_table::{Cell, Color, ContentArrangement, Table, modifiers, presets};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -442,6 +443,14 @@ impl Report {
             println!("Эталон · {}", host_summary(&baseline.host));
             print_tool_changes(baseline, self);
             print_scale_legend();
+        } else {
+            println!("Ориентиры для VPS · пороги под шкалой «Норма / Хорошо»");
+            if self.measurements.iter().any(|row| {
+                matches!(row.test.section(), Section::Network | Section::Latency)
+                    && !row.outcome.metrics().is_empty()
+            }) {
+                println!("Сеть · оценка маршрута до указанного узла");
+            }
         }
         for section in Section::ORDER {
             let mut rows = self
@@ -459,11 +468,18 @@ impl Report {
             if let Some(context) = self.section_context(section) {
                 println!("  {context}");
             }
-            let mut headers = vec!["Замер и параметры", "Показатель", "Значение", "Статус"];
-            if baseline.is_some() {
-                headers.push("К эталону");
-            }
-            let mut table = table(color, &headers);
+            let headers: &[&str] = if baseline.is_some() {
+                &[
+                    "Замер и параметры",
+                    "Показатель",
+                    "Значение",
+                    "Статус",
+                    "К эталону",
+                ]
+            } else {
+                &["Замер и параметры", "Показатель", "Значение", "Оценка"]
+            };
+            let mut table = table(color, headers);
             for row in rows {
                 add_measurement(&mut table, row, baseline);
             }
@@ -501,24 +517,25 @@ fn add_measurement(table: &mut Table, row: &Measurement, baseline: Option<&Repor
     let mismatch = reference
         .is_some_and(|base| !comparable_parameters(row.test, &base.parameters, &row.parameters));
     for (index, metric) in row.outcome.metrics().iter().enumerate() {
-        let (label, status) = if index == 0 {
-            (label.as_str(), status_cell(Some(row)))
-        } else {
-            ("", Cell::new(""))
-        };
         let mut cells = vec![
-            Cell::new(label),
+            Cell::new(if index == 0 { &label } else { "" }),
             Cell::new(metric.kind.label()),
             metric_cell(metric.kind, metric.value),
-            status,
         ];
         if baseline.is_some() {
+            cells.push(if index == 0 {
+                status_cell(Some(row))
+            } else {
+                Cell::new("")
+            });
             cells.push(comparison_cell(
                 metric.kind,
                 reference.and_then(|base| metric_value(base.outcome.metrics(), metric.kind)),
                 Some(metric.value),
                 mismatch,
             ));
+        } else {
+            cells.push(rating_cell(row.test, &row.parameters, metric));
         }
         table.add_row(cells);
     }

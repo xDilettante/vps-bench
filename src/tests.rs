@@ -216,3 +216,100 @@ fn assessment_handles_noise_band_and_zero_baselines() {
         "—"
     );
 }
+
+#[test]
+fn first_run_scale_marks_cpu_boundaries_and_accounts_for_workers() {
+    use super::bench::{Metric, MetricKind::EventsPerSecond};
+    use super::quality::rating_cell;
+    use super::report::Case;
+
+    let single = json!({"threads": 1});
+    for (value, filled, label) in [
+        (0.0, 0, "Плохо"),
+        (499.9, 3, "Плохо"),
+        (500.0, 4, "Норма"),
+        (1199.9, 9, "Норма"),
+        (1200.0, 10, "Хорошо"),
+        (2400.0, 10, "Хорошо"),
+    ] {
+        let metric = Metric::new(EventsPerSecond, value);
+        let expected = format!(
+            "{}{} {label}\n≥500 / ≥1200",
+            "█".repeat(filled),
+            "░".repeat(10 - filled)
+        );
+        assert_eq!(
+            rating_cell(Case::CpuSingle, &single, &metric).content(),
+            expected
+        );
+    }
+
+    let rate = Metric::new(EventsPerSecond, 2000.0);
+    let four = json!({"threads": 4});
+    assert_eq!(
+        rating_cell(Case::CpuMulti, &four, &rate).content(),
+        "████░░░░░░ Норма\n≥2000 / ≥4800"
+    );
+    assert_eq!(
+        rating_cell(Case::CpuMulti, &json!({}), &rate).content(),
+        "—"
+    );
+}
+
+#[test]
+fn first_run_scale_rewards_lower_rtt_and_zero_loss() {
+    use super::bench::{Metric, MetricKind::*};
+    use super::quality::rating_cell;
+    use super::report::Case;
+
+    for (kind, value, expected) in [
+        (RttP95Ms, 30.0, "██████████ Хорошо\n≤100 / ≤30"),
+        (RttP95Ms, 100.0, "████░░░░░░ Норма\n≤100 / ≤30"),
+        (RttP95Ms, 101.0, "███░░░░░░░ Плохо\n≤100 / ≤30"),
+        (PacketLossPercent, 0.0, "██████████ Хорошо\n≤1 / ≤0"),
+        (PacketLossPercent, 1.0, "████░░░░░░ Норма\n≤1 / ≤0"),
+        (PacketLossPercent, 100.0, "░░░░░░░░░░ Плохо\n≤1 / ≤0"),
+    ] {
+        let metric = Metric::new(kind, value);
+        assert_eq!(
+            rating_cell(Case::PingUpload, &json!({}), &metric).content(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn first_run_scale_uses_the_workload_and_keeps_diagnostic_counts_unrated() {
+    use super::bench::{Metric, MetricKind::*};
+    use super::quality::rating_cell;
+    use super::report::Case;
+
+    let speed = Metric::new(MibPerSecond, 512.0);
+    assert_eq!(
+        rating_cell(Case::DiskSeqWrite, &json!({}), &speed).content(),
+        "██████████ Хорошо\n≥125 / ≥500"
+    );
+    let ram = json!({"block_mib": 64, "threads": 1});
+    assert_eq!(
+        rating_cell(Case::RamRead, &ram, &speed).content(),
+        "░░░░░░░░░░ Плохо\n≥5120 / ≥12288"
+    );
+    let cached_ram = json!({"block_mib": 4, "threads": 1});
+    assert_eq!(
+        rating_cell(Case::RamRead, &cached_ram, &speed).content(),
+        "—"
+    );
+    assert_eq!(
+        rating_cell(
+            Case::NetDown,
+            &json!({}),
+            &Metric::new(TcpRetransmits, 50.0)
+        )
+        .content(),
+        "—"
+    );
+    assert_eq!(
+        rating_cell(Case::PingIdle, &json!({}), &Metric::new(PacketsSent, 100.0)).content(),
+        "—"
+    );
+}
