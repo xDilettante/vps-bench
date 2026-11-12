@@ -4,12 +4,13 @@
 [![Release](https://img.shields.io/github/v/release/xDilettante/vps-bench)](https://github.com/xDilettante/vps-bench/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, disk and network, including latency and loss under TCP load. Displays live quality scales, keeps each stage's result in the terminal and saves a local JSON report.
+Rust CLI for benchmarking Linux VPS instances. Measures CPU, thread wakeup latency, cryptography, RAM, disk and network, including latency and loss under TCP load. Displays live quality scales, keeps each stage's result in the terminal and saves a local JSON report.
 
 | Раздел | Метрики |
 |---|---|
 | CPU и RAM | События/с в одном и нескольких потоках, CPU steal, чтение и запись RAM в МиБ/с |
 | Стабильность CPU | Секундные отсчёты за 5–10 минут, медиана, p10 и изменение скорости между первой и последней минутой |
+| Пробуждение потока | Задержка p99 и максимум в простое и под нагрузкой CPU, число замеров и пропущенных интервалов |
 | Crypto | Скорость SHA-256 и шифрования AES-256-GCM в МиБ/с |
 | Диск | Последовательная скорость, случайные IOPS и задержки p50/p95/p99, опционально `fdatasync` |
 | TCP | Входящая и исходящая скорость, повторные передачи и средний RTT при наличии данных |
@@ -22,7 +23,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, cryptography, RAM, 
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.11.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
@@ -32,7 +33,7 @@ ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.gith
 Короткий прогон показывает CPU, Crypto, память и диск. В Ubuntu для него нужны `curl`, `sysbench`, `openssl` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.11.0/run.sh | bash -s -- run --only cpu,crypto,memory,disk --seconds 5 --disk-mib 128'
 ```
 
 В терминале шкала времени и цветная оценка замера показаны на разных строках. Полоса обновляется с каждым замером и меняет цвет при пересечении порога. Для CPU, Crypto, RAM и TCP используется скорость за интервал, для диска — скорость последовательного I/O или случайные IOPS с начала этапа, для ICMP — RTT последнего ответа. Для живой скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее).
@@ -46,12 +47,24 @@ wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubuserc
 Режим `--only stability` нагружает CPU одним непрерывным прогоном `sysbench` и обновляет график по секундным отсчётам. Столбец графика показывает среднюю скорость за указанный интервал. Рядом виден диапазон скоростей на графике. В PowerShell можно запустить пятиминутный тест в один поток.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.10.0/run.sh | bash -s -- run --only stability --stability-minutes 5 --threads 1'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.11.0/run.sh | bash -s -- run --only stability --stability-minutes 5 --threads 1'
 ```
 
 `--stability-minutes` принимает целое число от 5 до 10, по умолчанию 5. Если опустить `--threads`, используются доступные vCPU. Итог показывает медиану и p10 скорости по всем отсчётам, медианы первой и последней минут и процент изменения. p10 берётся методом ближайшего ранга. Для каждой минуты видно покрытие из 60 отсчётов. Sysbench может завершиться до печати последнего отсчёта, поэтому в статистику входят только полученные значения. [Промежуточная статистика sysbench](https://github.com/akopytov/sysbench)
 
 JSON сохраняет показатели и `cpu_series.samples` с временем и скоростью каждого отсчёта. Результаты сравниваются через `compare a.json b.json` или `--baseline`. Для сопоставимых замеров задайте одинаковую длительность и число потоков.
+
+## Задержка пробуждения потока
+
+Режим `--only wakeup` выполняет две фазы. Первая проходит без нагрузки от VPS Bench, вторая начинается после подтверждения нагрузки от `sysbench cpu`. `--seconds` задаёт длительность каждой фазы, по умолчанию 15 с. `--threads` задаёт число потоков нагрузки, по умолчанию по одному на доступный vCPU. Для короткого прогона из PowerShell укажите два потока и шесть секунд на фазу.
+
+```powershell
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.11.0/run.sh | bash -s -- run --only wakeup --seconds 6 --threads 2'
+```
+
+Таймер задаёт абсолютные сроки пробуждения с шагом 1 мс по монотонным часам Linux. Замер показывает, на сколько микросекунд поток возобновил работу позже срока. Если поток пропустил несколько сроков, задержка первого попадает в статистику, остальные учитываются как пропущенные интервалы. [Linux clock_nanosleep](https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html)
+
+Живая шкала показывает последний замер. Итоговая таблица оценивает p99 и максимум отдельно по каждой фазе. p99 вычисляется методом ближайшего ранга по полученным замерам. JSON сохраняет `wakeup_p99_us`, `wakeup_max_us`, `wakeup_samples`, `wakeup_missed_intervals` и параметры двух фаз. Для `compare a.json b.json` и `--baseline` задавайте одинаковые длительность и число потоков нагрузки. Чем ниже p99 и максимум, тем лучше.
 
 ## Оценки первого запуска
 
@@ -61,6 +74,8 @@ JSON сохраняет показатели и `cpu_series.samples` с врем
 |---|---:|---:|
 | CPU sysbench, событий/с на поток | ≥ 500 | ≥ 1 200 |
 | CPU steal | ≤ 5% | ≤ 1% |
+| Пробуждение потока p99, мкс | ≤ 1 000 | ≤ 200 |
+| Пробуждение потока, максимум, мкс | ≤ 5 000 | ≤ 1 000 |
 | SHA-256, МиБ/с | ≥ 256 | ≥ 1 024 |
 | AES-256-GCM, МиБ/с | ≥ 512 | ≥ 2 048 |
 | Чтение RAM, МиБ/с | ≥ 5 120 | ≥ 12 288 |
@@ -110,6 +125,7 @@ tar -xzf vps-bench-linux-x86_64.tar.gz
 
 ```bash
 ./vps-bench run --only cpu,memory --seconds 15 --memory-mib 128
+./vps-bench run --only wakeup --seconds 15 --threads 2 -o wakeup.json
 ./vps-bench run --only crypto --seconds 6
 ./vps-bench run --only disk --disk-dir /mnt/data --disk-mib 1024 --disk-sync
 ./vps-bench run --only latency --ping-target node1.example.net --ping-count 100

@@ -101,6 +101,8 @@ fn thresholds(test: Case, parameters: &Value, kind: MetricKind) -> Option<(f64, 
             (500.0 * workers, 1200.0 * workers)
         }
         (_, CpuStealPercent) => (5.0, 1.0),
+        (WakeupIdle | WakeupCpuLoad, WakeupP99Us) => (1000.0, 200.0),
+        (WakeupIdle | WakeupCpuLoad, WakeupMaxUs) => (5000.0, 1000.0),
         (CryptoSha256, MibPerSecond) => (256.0, 1024.0),
         (CryptoAes256Gcm, MibPerSecond) => (512.0, 2048.0),
         (RamRead | RamWrite, MibPerSecond)

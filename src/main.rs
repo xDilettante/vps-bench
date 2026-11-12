@@ -6,6 +6,7 @@ mod progress;
 mod quality;
 mod report;
 mod stability;
+mod wakeup;
 
 #[cfg(test)]
 mod tests;
@@ -76,7 +77,7 @@ struct RunArgs {
     /// Длительность прогона --only stability в минутах.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(5..=10))]
     stability_minutes: u32,
-    /// Потоки многопоточного CPU-теста. По умолчанию используются доступные vCPU.
+    /// Потоки многопоточных CPU-тестов и нагрузки wakeup. По умолчанию используются доступные vCPU.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1024))]
     threads: Option<u32>,
     /// Размер рабочего буфера RAM в МиБ, степень двойки.
@@ -223,7 +224,10 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         (
             "sysbench",
             args.only.iter().any(|section| {
-                matches!(section, Section::Cpu | Section::Stability | Section::Memory)
+                matches!(
+                    section,
+                    Section::Cpu | Section::Stability | Section::Wakeup | Section::Memory
+                )
             }),
         ),
         ("openssl", args.only.contains(&Section::Crypto)),
@@ -337,7 +341,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
                 .as_u64()
                 .and_then(|seconds| u32::try_from(seconds).ok());
             let stage = progress.start(test, &parameters, planned);
-            let outcome = if let Some(reason) = unavailable.get(test.tool()) {
+            let outcome = if let Some(reason) = test.tool().and_then(|tool| unavailable.get(tool)) {
                 if section == Section::Crypto {
                     Outcome::Skipped {
                         reason: format!("OpenSSL недоступен · {reason}"),
@@ -415,6 +419,12 @@ fn profile(test: Case, args: &RunArgs, threads: usize) -> Value {
             "sample_seconds": 1,
             "comparison_window_seconds": MINUTE_SECONDS,
         }),
+        Case::WakeupIdle => json!({"seconds": seconds, "interval_us": wakeup::INTERVAL_US}),
+        Case::WakeupCpuLoad => json!({
+            "seconds": seconds,
+            "interval_us": wakeup::INTERVAL_US,
+            "load": {"threads": threads, "cpu_max_prime": bench::CPU_PRIME},
+        }),
         Case::CryptoSha256 | Case::CryptoAes256Gcm => json!({
             "seconds": seconds,
             "threads": 1,
@@ -465,6 +475,8 @@ fn measure(
         Case::CpuStability => {
             return stability::run(args.stability_minutes * MINUTE_SECONDS, threads, stage);
         }
+        Case::WakeupIdle => wakeup::run(seconds, stage),
+        Case::WakeupCpuLoad => wakeup::under_cpu_load(seconds, threads, stage),
         Case::CryptoSha256 => bench::crypto(seconds, "sha256", stage),
         Case::CryptoAes256Gcm => bench::crypto(seconds, "aes-256-gcm", stage),
         Case::RamRead => bench::memory(seconds, args.memory_mib, "read", stage),

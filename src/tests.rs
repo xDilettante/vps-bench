@@ -304,6 +304,34 @@ fn stability_graph_keeps_elapsed_time_and_marks_missing_buckets() {
 }
 
 #[test]
+fn wakeup_deadlines_skip_expired_ticks_without_shifting_the_schedule() {
+    use super::wakeup::next_tick;
+    use std::time::Duration;
+
+    assert_eq!(next_tick(2, Duration::from_micros(2140), 10), 3);
+    assert_eq!(next_tick(2, Duration::from_micros(4200), 10), 5);
+    assert_eq!(next_tick(2, Duration::from_micros(4000), 10), 5);
+    assert_eq!(next_tick(8, Duration::from_secs(1), 10), 11);
+}
+
+#[test]
+fn wakeup_percentile_maximum_and_coverage_use_actual_samples() {
+    use super::wakeup::summarize;
+    use std::time::Duration;
+
+    let samples = (1..=100).rev().map(Duration::from_micros).collect();
+    let metrics = summarize(samples, 120).unwrap();
+    assert_eq!(
+        metrics
+            .iter()
+            .map(|metric| metric.value)
+            .collect::<Vec<_>>(),
+        [99.0, 100.0, 100.0, 20.0]
+    );
+    assert!(summarize(Vec::new(), 120).is_err());
+}
+
+#[test]
 fn fio_uses_the_last_complete_report_for_final_metrics() {
     use super::bench::last_fio_report;
     let output = r#"{"jobs":[{"read":{"bw_bytes":100}}]}

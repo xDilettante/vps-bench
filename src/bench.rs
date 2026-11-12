@@ -22,6 +22,10 @@ pub enum MetricKind {
     FirstMinuteMedianEventsPerSecond,
     LastMinuteMedianEventsPerSecond,
     LastMinuteChangePercent,
+    WakeupP99Us,
+    WakeupMaxUs,
+    WakeupSamples,
+    WakeupMissedIntervals,
     MibPerSecond,
     CpuStealPercent,
     Iops,
@@ -50,6 +54,10 @@ impl MetricKind {
             Self::FirstMinuteMedianEventsPerSecond => "Медиана первой минуты, событий/с",
             Self::LastMinuteMedianEventsPerSecond => "Медиана последней минуты, событий/с",
             Self::LastMinuteChangePercent => "Изменение к первой минуте, %",
+            Self::WakeupP99Us => "Пробуждение p99, мкс",
+            Self::WakeupMaxUs => "Максимум, мкс",
+            Self::WakeupSamples => "Замеров",
+            Self::WakeupMissedIntervals => "Пропущено интервалов",
             Self::MibPerSecond => "Скорость, МиБ/с",
             Self::CpuStealPercent => "CPU steal, %",
             Self::Iops => "Операций/с (IOPS)",
@@ -272,14 +280,7 @@ pub fn run_cpu(
     let before = read_cpu_ticks();
     let output = observed_command(
         "sysbench",
-        [
-            format!("--time={seconds}"),
-            format!("--threads={threads}"),
-            format!("--report-interval={}", u8::from(observe.is_some())),
-            format!("--cpu-max-prime={CPU_PRIME}"),
-            "cpu".into(),
-            "run".into(),
-        ],
+        cpu_args(seconds, threads, observe.is_some()),
         seconds + 10,
         None,
         observe,
@@ -292,6 +293,17 @@ pub fn run_cpu(
         metrics.push(Metric::new(MetricKind::CpuStealPercent, percent));
     }
     Ok(metrics)
+}
+
+pub fn cpu_args(seconds: u32, threads: usize, report_intervals: bool) -> [String; 6] {
+    [
+        format!("--time={seconds}"),
+        format!("--threads={threads}"),
+        format!("--report-interval={}", u8::from(report_intervals)),
+        format!("--cpu-max-prime={CPU_PRIME}"),
+        "cpu".into(),
+        "run".into(),
+    ]
 }
 
 pub fn crypto(seconds: u32, algorithm: &str, stage: &Stage<'_>) -> Result<Vec<Metric>, String> {

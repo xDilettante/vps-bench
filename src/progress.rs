@@ -127,6 +127,13 @@ impl Stage<'_> {
         self.bar.is_some()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn reset_elapsed(&self) {
+        if let Some(bar) = &self.bar {
+            bar.reset_elapsed();
+        }
+    }
+
     pub fn update(&self, message: impl Into<std::borrow::Cow<'static, str>>) {
         if let Some(bar) = &self.bar {
             bar.set_message(message);
@@ -204,6 +211,7 @@ impl Stage<'_> {
         match self.test {
             Case::CpuSingle | Case::CpuMulti => MetricKind::EventsPerSecond,
             Case::CpuStability => MetricKind::EventsPerSecondP50,
+            Case::WakeupIdle | Case::WakeupCpuLoad => MetricKind::WakeupP99Us,
             Case::CryptoSha256
             | Case::CryptoAes256Gcm
             | Case::RamRead
@@ -235,6 +243,7 @@ impl Stage<'_> {
         for kind in [
             self.primary_metric(),
             MetricKind::EventsPerSecondP10,
+            MetricKind::WakeupMaxUs,
             MetricKind::PacketLossPercent,
             MetricKind::SyncP95Ms,
         ] {
@@ -246,6 +255,8 @@ impl Stage<'_> {
                 MetricKind::EventsPerSecond => format!("{value:.2} событий/с"),
                 MetricKind::EventsPerSecondP50 => format!("медиана {value:.2} событий/с"),
                 MetricKind::EventsPerSecondP10 => format!("p10 {value:.2} событий/с"),
+                MetricKind::WakeupP99Us => format!("пробуждение p99 {value:.2} мкс"),
+                MetricKind::WakeupMaxUs => format!("максимум {value:.2} мкс"),
                 MetricKind::MibPerSecond => format!("{value:.2} МиБ/с"),
                 MetricKind::Iops => format!("{value:.2} IOPS"),
                 MetricKind::MegabitsPerSecond => format!("{value:.2} Мбит/с"),

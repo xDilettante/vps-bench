@@ -60,10 +60,32 @@ jobs:
           jq -e '(.tools.openssl | length > 0) and (.measurements | map(.test) == ["crypto_sha256", "crypto_aes256_gcm"] and all(.[]; .status == "completed" and .parameters.block_kib == 16 and .parameters.sample_seconds == 1 and any(.metrics[]; .kind == "mib_per_second" and .value > 0)))' /tmp/vps-bench-crypto.json
           target/debug/vps-bench --color never compare /tmp/vps-bench-crypto.json /tmp/vps-bench-crypto.json > /tmp/vps-bench-crypto-compare.log
           test "$(grep -c 'Близко +0.00%' /tmp/vps-bench-crypto-compare.log)" -eq 2
-      - name: Check ICMP and TCP load on loopback
+      - name: Install CPU and network tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y iputils-ping iperf3
+          sudo apt-get install -y sysbench iputils-ping iperf3
+      - name: Check scheduler wakeup latency under CPU load
+        run: |
+          TERM=xterm-256color script -qefc 'stty cols 100 && target/debug/vps-bench run --only wakeup --seconds 3 --threads 2 --output /tmp/vps-bench-wakeup.json' /tmp/vps-bench-wakeup-terminal.log < /dev/null
+          grep -qF 'Ожидание нагрузки sysbench' /tmp/vps-bench-wakeup-terminal.log
+          grep -Eq '(Плохо|Норма|Хорошо).*последний .* мкс · замеров' /tmp/vps-bench-wakeup-terminal.log
+          test "$(grep -c 'Итог.*пробуждение p99' /tmp/vps-bench-wakeup-terminal.log)" -eq 2
+          test "$(grep -c 'Итог.*максимум' /tmp/vps-bench-wakeup-terminal.log)" -eq 2
+          jq -e '
+            .measurements |
+            map(.test) == ["wakeup_idle", "wakeup_cpu_load"] and
+            .[1].parameters.load == {threads: 2, cpu_max_prime: 20000} and
+            all(.[]; .status == "completed" and .parameters.seconds == 3 and
+              .parameters.interval_us == 1000 and
+              (.metrics | map({key: .kind, value: .value}) | from_entries |
+                .wakeup_p99_us >= 0 and .wakeup_max_us >= .wakeup_p99_us and
+                .wakeup_samples > 0 and .wakeup_missed_intervals >= 0 and
+                .wakeup_samples + .wakeup_missed_intervals == 3000))
+          ' /tmp/vps-bench-wakeup.json
+          target/debug/vps-bench --color never compare /tmp/vps-bench-wakeup.json /tmp/vps-bench-wakeup.json > /tmp/vps-bench-wakeup-compare.log
+          test "$(grep -c 'Близко +0.00%' /tmp/vps-bench-wakeup-compare.log)" -eq 4
+      - name: Check ICMP and TCP load on loopback
+        run: |
           iperf3 -s -B 127.0.0.1 -p 35201 > /tmp/vps-bench-iperf.log 2>&1 &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT

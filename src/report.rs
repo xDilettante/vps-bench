@@ -19,6 +19,7 @@ const SCHEMA_VERSION: u32 = 1;
 pub enum Section {
     Cpu,
     Stability,
+    Wakeup,
     Crypto,
     Memory,
     Disk,
@@ -27,9 +28,10 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ORDER: [Self; 7] = [
+    pub const ORDER: [Self; 8] = [
         Self::Cpu,
         Self::Stability,
+        Self::Wakeup,
         Self::Crypto,
         Self::Memory,
         Self::Disk,
@@ -41,6 +43,7 @@ impl Section {
         let title = match self {
             Self::Cpu => "CPU · Процессор",
             Self::Stability => "Стабильность · CPU",
+            Self::Wakeup => "Планировщик · Задержка пробуждения",
             Self::Crypto => "Crypto · Криптография",
             Self::Memory => "RAM · Оперативная память",
             Self::Disk => "Диск · Накопитель",
@@ -61,6 +64,8 @@ pub enum Case {
     CpuSingle,
     CpuMulti,
     CpuStability,
+    WakeupIdle,
+    WakeupCpuLoad,
     CryptoSha256,
     CryptoAes256Gcm,
     RamRead,
@@ -80,10 +85,12 @@ pub enum Case {
 }
 
 impl Case {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::CpuSingle,
         Self::CpuMulti,
         Self::CpuStability,
+        Self::WakeupIdle,
+        Self::WakeupCpuLoad,
         Self::CryptoSha256,
         Self::CryptoAes256Gcm,
         Self::RamRead,
@@ -104,6 +111,8 @@ impl Case {
             Self::CpuSingle => "Однопоточная производительность",
             Self::CpuMulti => "Многопоточная производительность",
             Self::CpuStability => "Длительная нагрузка CPU",
+            Self::WakeupIdle => "Пробуждение в простое",
+            Self::WakeupCpuLoad => "Пробуждение под нагрузкой CPU",
             Self::CryptoSha256 => "SHA-256 · Хеширование",
             Self::CryptoAes256Gcm => "AES-256-GCM · Шифрование",
             Self::RamRead | Self::DiskSeqRead => "Последовательное чтение",
@@ -125,6 +134,7 @@ impl Case {
         match self {
             Self::CpuSingle | Self::CpuMulti => Section::Cpu,
             Self::CpuStability => Section::Stability,
+            Self::WakeupIdle | Self::WakeupCpuLoad => Section::Wakeup,
             Self::CryptoSha256 | Self::CryptoAes256Gcm => Section::Crypto,
             Self::RamRead | Self::RamWrite => Section::Memory,
             Self::DiskSeqWrite
@@ -155,6 +165,19 @@ impl Case {
                 threads(&parameters["threads"]),
                 amount("sample_seconds")
             ),
+            Section::Wakeup => {
+                let mut workload =
+                    format!("Таймер · шаг {} мкс · {seconds} с", amount("interval_us"));
+                if self == Self::WakeupCpuLoad {
+                    let load = &parameters["load"];
+                    workload.push_str(&format!(
+                        " · sysbench cpu · простые до {} · {}",
+                        load["cpu_max_prime"],
+                        threads(&load["threads"])
+                    ));
+                }
+                workload
+            }
             Section::Crypto => {
                 let mode = if parameters["aead"].as_bool() == Some(true) {
                     " -aead"
@@ -224,13 +247,16 @@ impl Case {
         }
     }
 
-    pub fn tool(self) -> &'static str {
+    pub fn tool(self) -> Option<&'static str> {
         match self.section() {
-            Section::Cpu | Section::Stability | Section::Memory => "sysbench",
-            Section::Crypto => "openssl",
-            Section::Disk => "fio",
-            Section::Latency => "ping",
-            Section::Network => "iperf3",
+            Section::Wakeup if self == Self::WakeupIdle => None,
+            Section::Cpu | Section::Stability | Section::Wakeup | Section::Memory => {
+                Some("sysbench")
+            }
+            Section::Crypto => Some("openssl"),
+            Section::Disk => Some("fio"),
+            Section::Latency => Some("ping"),
+            Section::Network => Some("iperf3"),
         }
     }
 }
@@ -426,7 +452,7 @@ impl Report {
 
     pub fn section_context(&self, section: Section) -> Option<String> {
         match section {
-            Section::Cpu | Section::Stability => Some(format!(
+            Section::Cpu | Section::Stability | Section::Wakeup => Some(format!(
                 "{} · доступно {} vCPU",
                 clean(self.host.cpu_model.as_deref().unwrap_or(&self.host.arch)),
                 self.host.available_vcpus
@@ -976,7 +1002,11 @@ fn comparison_cell(
 pub fn assessment(kind: MetricKind, before: f64, after: f64) -> Cell {
     if matches!(
         kind,
-        MetricKind::PacketsSent | MetricKind::PacketsReceived | MetricKind::LastMinuteChangePercent
+        MetricKind::PacketsSent
+            | MetricKind::PacketsReceived
+            | MetricKind::LastMinuteChangePercent
+            | MetricKind::WakeupSamples
+            | MetricKind::WakeupMissedIntervals
     ) {
         return Cell::new("—");
     }
@@ -1049,7 +1079,13 @@ pub fn assessment(kind: MetricKind, before: f64, after: f64) -> Cell {
 }
 
 fn metric_cell(kind: MetricKind, value: f64) -> Cell {
-    if matches!(kind, MetricKind::PacketsSent | MetricKind::PacketsReceived) {
+    if matches!(
+        kind,
+        MetricKind::PacketsSent
+            | MetricKind::PacketsReceived
+            | MetricKind::WakeupSamples
+            | MetricKind::WakeupMissedIntervals
+    ) {
         return Cell::new(format!("{value:.0}"));
     }
     if kind == MetricKind::LastMinuteChangePercent {
