@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/xDilettante/vps-bench)](https://github.com/xDilettante/vps-bench/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Displays live measurements, rates the results against built-in targets and saves a local JSON report.
+Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and network, including latency and loss under TCP load. Displays live quality scales, keeps each stage's result in the terminal and saves a local JSON report.
 
 | Раздел | Метрики |
 |---|---|
@@ -20,7 +20,7 @@ Rust CLI for benchmarking Linux VPS instances. Measures CPU, RAM, disk and netwo
 Подставьте SSH-адрес тестируемого VPS, адрес сервера `iperf3` и имена или IP узлов для ICMP. Команда выбирает архив для Linux x86-64 или ARM64, проверяет SHA-256 и запускает утилиту в текущем SSH-каталоге.
 
 ```powershell
-ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.6.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
+ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.7.0/run.sh | bash -s -- run --label vps-a --iperf-host bench.example.net --ping-target node1.example.net,node2.example.net --output vps-a.json'''
 ```
 
 Для замера только RTT и потерь добавьте `--only latency` после `run`. Для второго VPS поменяйте SSH-адрес, метку и имя файла. Используйте те же узлы, сервер `iperf3` и параметры тестов.
@@ -30,10 +30,12 @@ ssh -t user@vps-a.example.net 'bash -o pipefail -c ''curl -fsSL https://raw.gith
 Короткий прогон показывает разделы CPU, памяти и диска. В Ubuntu для него нужны `curl`, `sysbench` и `fio`.
 
 ```powershell
-wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.6.0/run.sh | bash -s -- run --only cpu,memory,disk --seconds 5 --disk-mib 128'
+wsl -d Ubuntu -- bash -o pipefail -c 'cd ~ && curl -fsSL https://raw.githubusercontent.com/xDilettante/vps-bench/v0.7.0/run.sh | bash -s -- run --only cpu,memory,disk --seconds 5 --disk-mib 128'
 ```
 
-В терминале видны текущий этап, шкала времени и промежуточные показатели. Для CPU, RAM и TCP выводятся значения за интервал, для диска — средние с начала этапа, для ICMP — RTT последнего ответа и счётчик ответов. Для промежуточной скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее). При перенаправлении stderr или с `--no-progress` остаётся итоговый отчёт.
+В терминале шкала времени и цветная оценка замера показаны на разных строках. Полоса обновляется с каждым замером и меняет цвет при пересечении порога. Для CPU, RAM и TCP используется скорость за интервал, для диска — скорость последовательного I/O или случайные IOPS с начала этапа, для ICMP — RTT последнего ответа. Для живой скорости TCP нужен `iperf3` с `--json-stream` (3.17 и новее).
+
+После каждого этапа в терминале остаётся строка «Итог» с оценкой по финальным данным. Для ICMP выводятся RTT p95 и потери отдельно по каждому узлу. У быстрых тестов и TCP со старым `iperf3` первый доступный результат может быть итоговым. Живые оценки используют встроенные пороги VPS Bench. При перенаправлении stderr или с `--no-progress` выводится итоговый отчёт.
 
 Для просмотра только RTT укажите `run --only latency --ping-target 127.0.0.1 --ping-count 40`. Живой экран, итог и сравнение показывают параметры каждого этапа. Диск определяется по каталогу `--disk-dir`. При доступности `findmnt` и `lsblk` выводятся том, файловая система и характеристики блочного устройства, видимые Linux. Флаг `ROTA` относится к устройству в гостевой ОС.
 

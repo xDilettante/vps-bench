@@ -319,7 +319,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
         progress.section(section, report.section_context(section).as_deref());
         for (test, parameters) in tests {
             let planned = (test != Case::DiskSeqWrite).then_some(args.seconds);
-            let stage = progress.start(test.label(), &test.workload(&parameters), planned);
+            let stage = progress.start(test, &parameters, planned);
             let outcome = if let Some(reason) = unavailable.get(test.tool()) {
                 Outcome::Failed {
                     reason: reason.clone(),
@@ -356,7 +356,7 @@ fn run(mut args: RunArgs, color: ColorMode) -> Result<bool, String> {
             if test == Case::DiskSeqWrite {
                 disk_written = matches!(outcome, Outcome::Completed { .. });
             }
-            stage.finish([&outcome]);
+            stage.finish([(None, &outcome)]);
             report
                 .measurements
                 .push(Measurement::new(test, None, parameters, outcome));
@@ -418,7 +418,7 @@ fn measure(
     threads: usize,
     disk: Result<&Path, &str>,
     stream_iperf: bool,
-    stage: &Stage,
+    stage: &Stage<'_>,
 ) -> Result<Vec<bench::Metric>, String> {
     let seconds = args.seconds;
     match test {

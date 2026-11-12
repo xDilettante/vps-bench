@@ -220,28 +220,28 @@ fn assessment_handles_noise_band_and_zero_baselines() {
 #[test]
 fn first_run_scale_marks_cpu_boundaries_and_accounts_for_workers() {
     use super::bench::{Metric, MetricKind::EventsPerSecond};
-    use super::quality::rating_cell;
+    use super::quality::{rating, rating_cell};
     use super::report::Case;
 
     let single = json!({"threads": 1});
-    for (value, filled, label) in [
-        (0.0, 0, "Плохо"),
-        (499.9, 3, "Плохо"),
-        (500.0, 4, "Норма"),
-        (1199.9, 9, "Норма"),
-        (1200.0, 10, "Хорошо"),
-        (2400.0, 10, "Хорошо"),
+    for (value, filled, label, ansi) in [
+        (0.0, 0, "Плохо", 31),
+        (499.9, 3, "Плохо", 31),
+        (500.0, 4, "Норма", 33),
+        (1199.9, 9, "Норма", 33),
+        (1200.0, 10, "Хорошо", 32),
+        (2400.0, 10, "Хорошо", 32),
     ] {
         let metric = Metric::new(EventsPerSecond, value);
-        let expected = format!(
-            "{}{} {label}\n≥500 / ≥1200",
-            "█".repeat(filled),
-            "░".repeat(10 - filled)
-        );
+        let bar = format!("{}{} {label}", "█".repeat(filled), "░".repeat(10 - filled));
+        let expected = format!("{bar}\n≥500 / ≥1200");
         assert_eq!(
             rating_cell(Case::CpuSingle, &single, &metric).content(),
             expected
         );
+        let live = rating(Case::CpuSingle, &single, &metric).unwrap();
+        assert_eq!(live.terminal(false), bar);
+        assert_eq!(live.terminal(true), format!("\x1b[{ansi}m{bar}\x1b[0m"));
     }
 
     let rate = Metric::new(EventsPerSecond, 2000.0);

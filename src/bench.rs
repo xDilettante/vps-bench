@@ -209,11 +209,11 @@ pub fn sysbench_interval(line: &str, memory: bool) -> Option<f64> {
         .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
-pub fn cpu(seconds: u32, threads: usize, stage: &Stage) -> Result<Vec<Metric>, String> {
+pub fn cpu(seconds: u32, threads: usize, stage: &Stage<'_>) -> Result<Vec<Metric>, String> {
     let before = read_cpu_ticks();
     let mut observe = |line: &str| {
         if let Some(rate) = sysbench_interval(line, false) {
-            stage.update(format!("{rate:.1} событий/с · за интервал"));
+            stage.sample(rate, format!("{rate:.1} событий/с · за интервал"));
         }
     };
     let output = observed_command(
@@ -244,11 +244,11 @@ pub fn memory(
     seconds: u32,
     block_mib: u32,
     operation: &str,
-    stage: &Stage,
+    stage: &Stage<'_>,
 ) -> Result<Vec<Metric>, String> {
     let mut observe = |line: &str| {
         if let Some(rate) = sysbench_interval(line, true) {
-            stage.update(format!("{rate:.1} МиБ/с · за интервал"));
+            stage.sample(rate, format!("{rate:.1} МиБ/с · за интервал"));
         }
     };
     let output = observed_command(
@@ -280,7 +280,7 @@ pub fn disk(
     seconds: u32,
     size_mib: u32,
     mode: &str,
-    stage: &Stage,
+    stage: &Stage<'_>,
 ) -> Result<Vec<Metric>, String> {
     let create_file = mode == "write";
     let sync = mode == "sync";
@@ -344,15 +344,16 @@ pub fn disk(
                     stats["iops"].as_f64(),
                 ) && bytes > 0
                 {
-                    if create_file {
-                        stage.update(format!(
-                            "{:.0}/{size_mib} МиБ · {:.1} МиБ/с",
-                            bytes as f64 / MIB,
-                            bw / MIB
-                        ));
+                    let speed = bw / MIB;
+                    let detail = if create_file {
+                        format!(
+                            "{:.0}/{size_mib} МиБ · {speed:.1} МиБ/с",
+                            bytes as f64 / MIB
+                        )
                     } else {
-                        stage.update(format!("{:.1} МиБ/с · {iops:.0} IOPS · среднее", bw / MIB));
-                    }
+                        format!("{speed:.1} МиБ/с · {iops:.0} IOPS · среднее")
+                    };
+                    stage.sample(if random { iops } else { speed }, detail);
                 }
             }
             snapshot.clear();
@@ -437,7 +438,7 @@ pub fn network(
     streams: u32,
     reverse: bool,
     streaming: bool,
-    stage: &Stage,
+    stage: &Stage<'_>,
 ) -> Result<Vec<Metric>, String> {
     let mut args = vec![
         format!("--client={host}"),
@@ -461,7 +462,7 @@ pub fn network(
     stage.update("Измерение пропускной способности TCP");
     let mut observe = |line: &str| {
         if let Some(rate) = iperf_interval_mbps(line) {
-            stage.update(format!("{rate:.1} Мбит/с · за интервал"));
+            stage.sample(rate, format!("{rate:.1} Мбит/с · за интервал"));
         }
     };
     let output = observed_command(

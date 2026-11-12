@@ -45,8 +45,8 @@ pub fn run(
         }
         let first = measurements.len();
         let stage = progress.start(
-            test.label(),
-            &test.workload(&profile),
+            test,
+            &profile,
             Some(if server.is_some() {
                 load_seconds
             } else {
@@ -110,7 +110,7 @@ pub fn run(
         stage.finish(
             measurements[first..]
                 .iter()
-                .map(|measurement| &measurement.outcome),
+                .map(|measurement| (measurement.target.as_deref(), &measurement.outcome)),
         );
     }
     measurements
@@ -120,7 +120,7 @@ fn ping_all(
     targets: &[String],
     count: u32,
     deadline: u32,
-    stage: &Stage,
+    stage: &Stage<'_>,
 ) -> Vec<Result<Probe, String>> {
     thread::scope(|scope| {
         let workers: Vec<_> = targets
@@ -141,7 +141,7 @@ fn ping_all(
     })
 }
 
-fn ping(target: &str, count: u32, deadline: u32, stage: &Stage) -> Result<Probe, String> {
+fn ping(target: &str, count: u32, deadline: u32, stage: &Stage<'_>) -> Result<Probe, String> {
     let interval = format!("{:.3}", f64::from(INTERVAL_MS) / 1000.0);
     let mut command = timed_command("ping", deadline + 3);
     command.args([
@@ -161,9 +161,10 @@ fn ping(target: &str, count: u32, deadline: u32, stage: &Stage) -> Result<Probe,
     let mut observe = |line: &str| {
         if let Some(rtt) = reply_rtt(line) {
             replies += 1;
-            stage.update(format!(
-                "{target} · RTT {rtt:.3} мс · ответов {replies}/{count}"
-            ));
+            stage.sample(
+                rtt,
+                format!("RTT {rtt:.3} мс · ответов {replies}/{count} · {target}"),
+            );
         }
     };
     let output = capture(&mut command, stage.enabled().then_some(&mut observe))
@@ -238,7 +239,7 @@ fn under_load<T>(
     server: Load<'_>,
     seconds: u32,
     reverse: bool,
-    stage: &Stage,
+    stage: &Stage<'_>,
     capture: impl FnOnce() -> T,
 ) -> Result<T, String> {
     stage.update("Ожидание передачи iperf3");

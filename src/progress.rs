@@ -1,6 +1,9 @@
 use crate::bench::{Metric, MetricKind};
-use crate::report::{ColorMode, Outcome, Section, clean};
+use crate::quality::rating;
+use crate::report::{Case, ColorMode, Outcome, Section, clean};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
+use serde_json::Value;
+use std::fmt::Write;
 use std::io::{IsTerminal, stderr};
 use std::time::{Duration, Instant};
 
@@ -39,22 +42,39 @@ impl RunProgress {
         }
     }
 
-    pub fn start(&mut self, name: &str, workload: &str, planned_seconds: Option<u32>) -> Stage {
+    pub fn start<'a>(
+        &mut self,
+        test: Case,
+        parameters: &'a Value,
+        planned_seconds: Option<u32>,
+    ) -> Stage<'a> {
         self.index += 1;
-        let label = format!("{}/{}  {name}", self.index, self.total);
+        let label = format!("{}/{}  {}", self.index, self.total, test.label());
         let bar = self.enabled.then(|| {
-            let template = if self.color {
-                "{spinner:.cyan} {elapsed_precise:.cyan}  {prefix}\n  {workload}\n  {meter:.cyan}{wide_msg}"
+            let mut template = if self.color {
+                "{spinner:.cyan} {elapsed_precise:.cyan}  {prefix}\n  {workload}"
             } else {
-                "{spinner} {elapsed_precise}  {prefix}\n  {workload}\n  {meter}{wide_msg}"
-            };
-            let workload = workload.to_owned();
-            let style = ProgressStyle::with_template(template)
+                "{spinner} {elapsed_precise}  {prefix}\n  {workload}"
+            }
+            .to_owned();
+            if planned_seconds.is_some() {
+                template.push_str(if self.color {
+                    "\n  {meter:.cyan}"
+                } else {
+                    "\n  {meter}"
+                });
+            }
+            template.push_str("\n  {wide_msg}");
+            let workload = test.workload(parameters);
+            let style = ProgressStyle::with_template(&template)
                 .expect("valid progress template")
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓")
-                .with_key("workload", move |_: &ProgressState, out: &mut dyn std::fmt::Write| {
-                    let _ = out.write_str(&workload);
-                })
+                .with_key(
+                    "workload",
+                    move |_: &ProgressState, out: &mut dyn std::fmt::Write| {
+                        let _ = out.write_str(&workload);
+                    },
+                )
                 .with_key(
                     "meter",
                     move |state: &ProgressState, out: &mut dyn std::fmt::Write| {
@@ -64,7 +84,7 @@ impl RunProgress {
                             let filled = (fraction * slots as f64).min(slots as f64) as usize;
                             let _ = write!(
                                 out,
-                                "{}{}  {seconds} с · ",
+                                "{}{}  {seconds} с",
                                 "━".repeat(filled),
                                 "─".repeat(slots - filled)
                             );
@@ -80,6 +100,8 @@ impl RunProgress {
         });
         Stage {
             bar,
+            test,
+            parameters,
             color: self.color,
             label,
             started: Instant::now(),
@@ -87,14 +109,16 @@ impl RunProgress {
     }
 }
 
-pub struct Stage {
+pub struct Stage<'a> {
     bar: Option<ProgressBar>,
+    test: Case,
+    parameters: &'a Value,
     color: bool,
     label: String,
     started: Instant,
 }
 
-impl Stage {
+impl Stage<'_> {
     pub fn enabled(&self) -> bool {
         self.bar.is_some()
     }
@@ -105,20 +129,27 @@ impl Stage {
         }
     }
 
-    pub fn finish<'a>(self, outcomes: impl IntoIterator<Item = &'a Outcome>) {
-        let Some(bar) = self.bar else {
+    pub fn sample(&self, value: f64, message: String) {
+        if let Some(bar) = &self.bar {
+            let metric = Metric::new(self.primary_metric(), value);
+            bar.set_message(self.rated(&metric, message));
+        }
+    }
+
+    pub fn finish<'a>(self, outcomes: impl IntoIterator<Item = (Option<&'a str>, &'a Outcome)>) {
+        let Some(bar) = &self.bar else {
             return;
         };
         bar.finish_and_clear();
         let mut complete = 0;
         let mut failed = 0;
         let mut skipped = 0;
-        let mut metrics = &[][..];
-        for outcome in outcomes {
+        let mut summaries = String::new();
+        for (target, outcome) in outcomes {
             match outcome {
-                Outcome::Completed { metrics: sample } => {
+                Outcome::Completed { metrics } => {
                     complete += 1;
-                    metrics = sample;
+                    self.append_summary(&mut summaries, target, metrics);
                 }
                 Outcome::Failed { .. } => failed += 1,
                 Outcome::Skipped { .. } => skipped += 1,
@@ -140,31 +171,62 @@ impl Stage {
         let detail = if complete + failed + skipped > 1 {
             format!(" · узлов готово {complete}/{}", complete + failed + skipped)
         } else {
-            summary(metrics).map_or_else(String::new, |value| format!(" · {value}"))
+            String::new()
         };
-        eprintln!("{badge}  {}  ({elapsed:.1} с){detail}", self.label);
+        eprintln!(
+            "{badge}  {}  ({elapsed:.1} с){detail}{summaries}",
+            self.label
+        );
     }
-}
 
-fn summary(metrics: &[Metric]) -> Option<String> {
-    let lookup = |kind| {
-        metrics
-            .iter()
-            .find(|metric| metric.kind == kind)
-            .map(|m| m.value)
-    };
-    if let Some(loss) = lookup(MetricKind::PacketLossPercent) {
-        return Some(lookup(MetricKind::RttP95Ms).map_or_else(
-            || format!("потери {loss:.1}%"),
-            |p95| format!("p95 {p95:.3} мс · потери {loss:.1}%"),
-        ));
+    fn primary_metric(&self) -> MetricKind {
+        match self.test {
+            Case::CpuSingle | Case::CpuMulti => MetricKind::EventsPerSecond,
+            Case::RamRead | Case::RamWrite | Case::DiskSeqWrite | Case::DiskSeqRead => {
+                MetricKind::MibPerSecond
+            }
+            Case::DiskRandRead | Case::DiskRandWrite | Case::DiskSync => MetricKind::Iops,
+            Case::NetUp | Case::NetDown | Case::NetUpMulti | Case::NetDownMulti => {
+                MetricKind::MegabitsPerSecond
+            }
+            Case::PingIdle | Case::PingUpload | Case::PingDownload => MetricKind::RttP95Ms,
+        }
     }
-    let metric = metrics.first()?;
-    let unit = match metric.kind {
-        MetricKind::EventsPerSecond => "событий/с",
-        MetricKind::MibPerSecond => "МиБ/с",
-        MetricKind::MegabitsPerSecond => "Мбит/с",
-        _ => return None,
-    };
-    Some(format!("{:.1} {unit}", metric.value))
+
+    fn rated(&self, metric: &Metric, message: String) -> String {
+        match rating(self.test, self.parameters, metric) {
+            Some(rating) => format!("{} · {message}", rating.terminal(self.color)),
+            None => message,
+        }
+    }
+
+    fn append_summary(&self, out: &mut String, target: Option<&str>, metrics: &[Metric]) {
+        let indent = if let Some(target) = target {
+            let _ = write!(out, "\n  {}", clean(target));
+            "    "
+        } else {
+            "  "
+        };
+        for kind in [
+            self.primary_metric(),
+            MetricKind::PacketLossPercent,
+            MetricKind::SyncP95Ms,
+        ] {
+            let Some(metric) = metrics.iter().find(|metric| metric.kind == kind) else {
+                continue;
+            };
+            let value = metric.value;
+            let message = match kind {
+                MetricKind::EventsPerSecond => format!("{value:.2} событий/с"),
+                MetricKind::MibPerSecond => format!("{value:.2} МиБ/с"),
+                MetricKind::Iops => format!("{value:.2} IOPS"),
+                MetricKind::MegabitsPerSecond => format!("{value:.2} Мбит/с"),
+                MetricKind::RttP95Ms => format!("RTT p95 {value:.3} мс"),
+                MetricKind::PacketLossPercent => format!("потери {value:.2}%"),
+                MetricKind::SyncP95Ms => format!("fdatasync p95 {value:.3} мс"),
+                _ => continue,
+            };
+            let _ = write!(out, "\n{indent}Итог · {}", self.rated(metric, message));
+        }
+    }
 }
